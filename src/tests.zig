@@ -19,6 +19,7 @@ test {
     _ = @import("kernel_fetch.zig");
     _ = @import("session.zig");
     _ = @import("devices/virtio_fs.zig");
+    _ = @import("build.zig");
 }
 
 test "run args: docker-style flags, positional image + command, volume/env" {

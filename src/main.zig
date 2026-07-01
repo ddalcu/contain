@@ -11,6 +11,7 @@ const cpio = @import("cpio.zig");
 const registry = @import("oci/registry.zig");
 const rootfs = @import("rootfs.zig");
 const kernel_fetch = @import("kernel_fetch.zig");
+const build_mod = @import("build.zig");
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
 const Uart16550 = @import("devices/uart_16550.zig").Uart16550;
 
@@ -337,6 +338,9 @@ pub fn main(init: std.process.Init) !void {
         };
         const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
         try cmdRunOci(gpa, io, opts, cache_base);
+    } else if (std.mem.eql(u8, cmd, "build")) {
+        const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
+        try cmdBuild(gpa, io, args[2..], cache_base);
     } else {
         usage();
     }
@@ -438,6 +442,10 @@ fn usage() void {
         \\    --rm, --name, -u/--user             accepted for docker-compat (ignored)
         \\    -d, --detach                        unsupported (runs in foreground)
         \\
+        \\  contain build [-t NAME[:TAG]] [-f DOCKERFILE] CONTEXT
+        \\                                build an image from a Dockerfile (FROM/RUN/
+        \\                                COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT/ARG);
+        \\                                run it with `contain run NAME` (x86 only)
         \\  contain pull <image> [dir] [arch]   unpack an image's rootfs to <dir>
         \\                                      (default: ./<image>-rootfs)
         \\  contain boot <kernel> [initramfs] [input] [disk] [share] [ports]
@@ -597,6 +605,30 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
 
     std.debug.print("\n[contain] stopped (x86-microvm, accel={s}): run {d:.3}s wall\n", .{ @tagName(kind), secs });
     std.process.exit(0);
+}
+
+/// Boot a rootfs dir over virtio-fs, run its `/.contain-init`, and RETURN cleanly
+/// (unlike bootX86, which process.exit()s). Used by `contain build` to execute a
+/// sequence of RUN steps in one process — each step mounts the shared build rootfs
+/// rw so its changes persist. x86 only (build targets the host arch; the arm64 FUSE
+/// kernel isn't released yet). Returns error.BackendUnavailable if no x86 backend.
+fn bootBuildStep(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, rootfs_dir: []const u8) !void {
+    const host_default = accel.autoDefault();
+    const want = accel.fromEnvOrDefault(null);
+    const kind: accel.Kind = switch (want) {
+        .kvm, .whp => want,
+        else => host_default,
+    };
+    if (!accel.supported(kind)) return error.BackendUnavailable;
+
+    var rng_seed: [64]u8 = undefined;
+    if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
+
+    var m = try Machine.initX86(gpa, io, default_ram_virtiofs, null, rootfs_dir, true, rng_seed[0..32].*, kind == .whp);
+    defer m.deinit(); // clean teardown (no process.exit) so the next RUN step can boot
+    m.input = "";
+    try m.bootPvh(vmlinux, null);
+    _ = runMachineTimed(io, kind, m);
 }
 
 fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8) !void {
@@ -1048,6 +1080,343 @@ var force_initramfs_root: bool = false;
 fn useVirtiofsRoot() bool {
     if (force_initramfs_root) return false;
     return builtin.cpu.arch == .x86_64;
+}
+
+/// Accumulated build state -> the output image config.
+const BuildConfig = struct {
+    env: std.ArrayListUnmanaged([]const u8) = .empty,
+    workdir: []const u8 = "",
+    cmd: []const []const u8 = &.{},
+    entrypoint: []const []const u8 = &.{},
+    user: []const u8 = "",
+    exposed: std.ArrayListUnmanaged([]const u8) = .empty,
+};
+
+/// `contain build [-t NAME[:TAG]] [-f DOCKERFILE] CONTEXT` — build an image from a
+/// Dockerfile using the core instruction set (FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/
+/// ENTRYPOINT/ARG/…); no BuildKit. Each RUN executes inside a contain guest with
+/// the build rootfs mounted rw over virtio-fs so steps compose; COPY/ADD copy from
+/// the build context host-side; metadata accumulates into the output config. The
+/// result is stored in the image cache under NAME so `contain run NAME` runs it.
+fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cache_base: []const u8) !void {
+    if (builtin.cpu.arch != .x86_64) {
+        std.debug.print("contain build: only x86 hosts are supported for now (the arm64 FUSE guest kernel isn't released yet)\n", .{});
+        return;
+    }
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // Parse docker-style args: -t/--tag, -f/--file, positional CONTEXT.
+    var tag: []const u8 = "contain-build:latest";
+    var dockerfile: ?[]const u8 = null;
+    var context: []const u8 = ".";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-t") or std.mem.eql(u8, a, "--tag")) {
+            i += 1;
+            if (i < args.len) tag = args[i];
+        } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--file")) {
+            i += 1;
+            if (i < args.len) dockerfile = args[i];
+        } else if (a.len > 0 and a[0] == '-') {
+            // Unknown flags (e.g. --no-cache, --build-arg) are accepted-and-ignored
+            // so common invocations don't hard-fail. --build-arg takes a value.
+            if (std.mem.eql(u8, a, "--build-arg")) i += 1;
+        } else {
+            context = a;
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const df_path = dockerfile orelse try std.fmt.allocPrint(arena, "{s}/Dockerfile", .{context});
+    const df_src = cwd.readFileAlloc(io, df_path, gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain build: cannot read Dockerfile '{s}': {s}\n", .{ df_path, @errorName(err) });
+        return;
+    };
+    defer gpa.free(df_src);
+
+    var df = build_mod.parse(gpa, df_src) catch |err| {
+        std.debug.print("contain build: Dockerfile parse error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer df.deinit();
+    if (df.instructions.len == 0 or df.instructions[0].op != .from) {
+        std.debug.print("contain build: the first instruction must be FROM\n", .{});
+        return;
+    }
+
+    const arch = registry.Arch.hostDefault();
+    const entry = try registry.cacheEntryPath(arena, cache_base, tag, arch);
+    const rootfs_dir = try std.fmt.allocPrint(arena, "{s}/rootfs", .{entry});
+    const cfg_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{entry});
+    const complete = try std.fmt.allocPrint(arena, "{s}/.complete", .{entry});
+    const blobs_dir = try std.fmt.allocPrint(arena, "{s}/blobs", .{cache_base});
+
+    // Prepare + read the guest kernel once for all RUN steps.
+    const kernel_path = kernel_fetch.defaultKernelPath();
+    _ = kernel_fetch.ensureKernel(gpa, io, kernel_path) catch {};
+    const vmlinux = cwd.readFileAlloc(io, kernel_path, gpa, .limited(128 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain build: cannot read guest kernel '{s}': {s}\n", .{ kernel_path, @errorName(err) });
+        return;
+    };
+    defer gpa.free(vmlinux);
+
+    var bc = BuildConfig{};
+
+    var step: usize = 0;
+    for (df.instructions) |ins| {
+        switch (ins.op) {
+            .from => {
+                const base = build_mod.fromImage(ins.args);
+                std.debug.print("[build] FROM {s}\n", .{base});
+                cwd.deleteTree(io, entry) catch {};
+                cwd.createDirPath(io, rootfs_dir) catch {};
+                var tio = std.Io.Threaded.init(gpa, .{});
+                defer tio.deinit();
+                const base_cfg = registry.pull(gpa, arena, tio.io(), base, rootfs_dir, arch, .{
+                    .cache_dir = blobs_dir,
+                }) catch |err| {
+                    std.debug.print("contain build: pulling base '{s}' failed: {s}\n", .{ base, @errorName(err) });
+                    return;
+                };
+                // Seed the output config from the base image.
+                for (base_cfg.env) |e| try bc.env.append(arena, try arena.dupe(u8, e));
+                bc.workdir = try arena.dupe(u8, base_cfg.working_dir);
+                bc.cmd = base_cfg.cmd;
+                bc.entrypoint = base_cfg.entrypoint;
+                bc.user = try arena.dupe(u8, base_cfg.user);
+            },
+            .run => {
+                step += 1;
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                const shell_cmd = if (parsed.is_exec) try joinArgv(arena, parsed.argv) else parsed.argv[0];
+                std.debug.print("[build] RUN {s}\n", .{shell_cmd});
+                const init_script = try buildStepInit(arena, bc.env.items, nullIfEmpty(bc.workdir), shell_cmd);
+                const init_path = try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir});
+                try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
+                const status_path = try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir});
+                cwd.deleteFile(io, status_path) catch {};
+                bootBuildStep(gpa, io, vmlinux, rootfs_dir) catch |err| {
+                    std.debug.print("contain build: RUN step failed to boot: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                const st = cwd.readFileAlloc(io, status_path, gpa, .limited(64)) catch {
+                    std.debug.print("contain build: RUN did not report an exit status (guest crashed?)\n", .{});
+                    return;
+                };
+                defer gpa.free(st);
+                const code = std.fmt.parseInt(u32, std.mem.trim(u8, st, " \t\r\n"), 10) catch 1;
+                if (code != 0) {
+                    std.debug.print("contain build: RUN '{s}' exited with status {d}\n", .{ shell_cmd, code });
+                    return;
+                }
+            },
+            .copy, .add => {
+                const words = try build_mod.splitWords(arena, ins.args);
+                // Drop any --from=/--chown= flags (BuildKit/COPY options we don't model).
+                var srcs: std.ArrayListUnmanaged([]const u8) = .empty;
+                var dest: []const u8 = "";
+                for (words) |w| {
+                    if (w.len > 0 and w[0] == '-') continue;
+                    try srcs.append(arena, w);
+                }
+                if (srcs.items.len < 2) {
+                    std.debug.print("contain build: {s} needs at least a source and a destination\n", .{@tagName(ins.op)});
+                    return;
+                }
+                dest = srcs.items[srcs.items.len - 1];
+                const sources = srcs.items[0 .. srcs.items.len - 1];
+                copyIntoRootfs(io, gpa, arena, context, rootfs_dir, sources, dest) catch |err| {
+                    std.debug.print("contain build: {s} failed: {s}\n", .{ @tagName(ins.op), @errorName(err) });
+                    return;
+                };
+                std.debug.print("[build] {s} {d} path(s) -> {s}\n", .{ @tagName(ins.op), sources.len, dest });
+            },
+            .env => {
+                const pairs = try build_mod.parseEnv(arena, ins.args);
+                for (pairs) |p| try bc.env.append(arena, try arena.dupe(u8, p));
+            },
+            .workdir => {
+                bc.workdir = try arena.dupe(u8, std.mem.trim(u8, ins.args, " \t"));
+                // Create the workdir in the rootfs so a later `cd` succeeds.
+                const wd_abs = try std.fmt.allocPrint(arena, "{s}{s}", .{ rootfs_dir, bc.workdir });
+                cwd.createDirPath(io, wd_abs) catch {};
+            },
+            .cmd => {
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                bc.cmd = if (parsed.is_exec) parsed.argv else try shellArgv(arena, parsed.argv[0]);
+            },
+            .entrypoint => {
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                bc.entrypoint = if (parsed.is_exec) parsed.argv else try shellArgv(arena, parsed.argv[0]);
+            },
+            .user => bc.user = try arena.dupe(u8, std.mem.trim(u8, ins.args, " \t")),
+            .expose => try bc.exposed.append(arena, try arena.dupe(u8, ins.args)),
+            .arg, .label => {}, // accepted, not acted on (ARG defaults/LABEL metadata)
+            .unsupported => std.debug.print("[build] (skipping unsupported instruction at line {d})\n", .{ins.line}),
+        }
+    }
+
+    // Write the output image config (OCI image-config JSON) + the .complete marker,
+    // and drop the transient build init so it doesn't ship in the image.
+    cwd.deleteFile(io, try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir})) catch {};
+    cwd.deleteFile(io, try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir})) catch {};
+    const cfg_json = try renderImageConfig(arena, arch, bc);
+    try cwd.writeFile(io, .{ .sub_path = cfg_path, .data = cfg_json });
+    // Also drop it inside the rootfs (embedded config) for the library boot path.
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rootfs_dir, registry.embedded_config_name }), .data = cfg_json });
+    try cwd.writeFile(io, .{ .sub_path = complete, .data = "" });
+    std.debug.print("[build] built image '{s}'  ->  run it with: contain run {s}\n", .{ tag, tag });
+}
+
+fn nullIfEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+/// Wrap a shell-form command string as `["/bin/sh","-c",cmd]` (Docker's CMD/
+/// ENTRYPOINT shell form).
+fn shellArgv(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, 3);
+    out[0] = "/bin/sh";
+    out[1] = "-c";
+    out[2] = try a.dupe(u8, cmd);
+    return out;
+}
+
+/// Join an exec-form argv into a single shell command string (best-effort; args are
+/// space-joined — adequate for the common RUN ["sh","-c","…"] shape).
+fn joinArgv(a: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    for (argv, 0..) |arg, idx| {
+        if (idx != 0) try buf.append(a, ' ');
+        try buf.appendSlice(a, arg);
+    }
+    return buf.items;
+}
+
+/// The `/.contain-init` a RUN step boots: bring up mounts/console/networking, apply
+/// the accumulated ENV + WORKDIR, run the command, record its exit status to a
+/// host-readable file, and power off.
+fn buildStepInit(arena: std.mem.Allocator, env: []const []const u8, workdir: ?[]const u8, command: []const u8) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.writeAll(
+        \\#!/bin/sh
+        \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
+        \\mkdir -p /proc /sys /dev 2>/dev/null
+        \\mount -t proc proc /proc 2>/dev/null
+        \\mount -t sysfs sysfs /sys 2>/dev/null
+        \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
+        \\exec </dev/console >/dev/console 2>&1
+        \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null
+        \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+        \\ip link set eth0 up 2>/dev/null
+        \\ip route add default via 10.0.2.2 2>/dev/null || route add default gw 10.0.2.2 2>/dev/null
+        \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
+        \\
+    );
+    for (env) |e| try w.print("export \"{s}\"\n", .{e});
+    if (workdir) |d| try w.print("mkdir -p {s} 2>/dev/null; cd {s} 2>/dev/null\n", .{ d, d });
+    // Run the RUN command through /bin/sh; record its status for the host.
+    try w.writeAll("/bin/sh -c ");
+    try shellQuote(w, command);
+    try w.writeAll("\n__st=$?\n");
+    try w.writeAll("echo $__st > /.contain-build-status 2>/dev/null\nsync\n");
+    try w.writeAll(rootfs.poweroff_seq);
+    return aw.written();
+}
+
+/// Copy build-context `sources` (relative to `context`) into `dest` inside
+/// `rootfs_dir`. If dest ends in '/' or there are multiple sources, dest is a
+/// directory; otherwise a file rename. Recursive for directories.
+fn copyIntoRootfs(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, context: []const u8, rootfs_dir: []const u8, sources: []const []const u8, dest: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const dest_is_dir = dest.len == 0 or dest[dest.len - 1] == '/' or sources.len > 1 or std.mem.eql(u8, dest, ".");
+    var dclean = dest;
+    while (dclean.len > 0 and dclean[0] == '/') dclean = dclean[1..];
+    const dest_abs_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rootfs_dir, dclean });
+    if (dest_is_dir) cwd.createDirPath(io, dest_abs_base) catch {};
+    for (sources) |src| {
+        const src_abs = try std.fmt.allocPrint(arena, "{s}/{s}", .{ context, src });
+        const base = std.fs.path.basename(src);
+        const dst_abs = if (dest_is_dir)
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ dest_abs_base, base })
+        else
+            dest_abs_base;
+        try copyTree(io, gpa, arena, src_abs, dst_abs);
+    }
+}
+
+/// Recursively copy a host file or directory tree from `src` to `dst`.
+fn copyTree(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const st = cwd.statFile(io, src, .{}) catch |err| {
+        std.debug.print("contain build: cannot stat '{s}': {s}\n", .{ src, @errorName(err) });
+        return err;
+    };
+    if (st.kind == .directory) {
+        cwd.createDirPath(io, dst) catch {};
+        var dir = try cwd.openDir(io, src, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            const child_src = try std.fmt.allocPrint(arena, "{s}/{s}", .{ src, e.name });
+            const child_dst = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dst, e.name });
+            try copyTree(io, gpa, arena, child_src, child_dst);
+        }
+    } else {
+        // Ensure the destination's parent directory exists (e.g. COPY x /a/b/x
+        // where /a/b isn't in the base image yet).
+        if (std.fs.path.dirname(dst)) |parent| cwd.createDirPath(io, parent) catch {};
+        const data = try cwd.readFileAlloc(io, src, gpa, .limited(2 * 1024 * 1024 * 1024));
+        defer gpa.free(data);
+        try cwd.writeFile(io, .{ .sub_path = dst, .data = data });
+    }
+}
+
+/// Serialize the accumulated build config as an OCI image-config JSON (the shape
+/// registry.parseConfig reads back). Includes `architecture`/`os` so the pull-side
+/// arch check is satisfied if this image is ever inspected that way.
+fn renderImageConfig(arena: std.mem.Allocator, arch: registry.Arch, bc: BuildConfig) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"architecture\":\"{s}\",\"os\":\"linux\",\"config\":{{", .{arch.str()});
+    try w.writeAll("\"Env\":");
+    try writeJsonStrArray(w, bc.env.items);
+    try w.writeAll(",\"Cmd\":");
+    try writeJsonStrArray(w, bc.cmd);
+    try w.writeAll(",\"Entrypoint\":");
+    try writeJsonStrArray(w, bc.entrypoint);
+    try w.print(",\"WorkingDir\":", .{});
+    try writeJsonString(w, bc.workdir);
+    try w.writeAll(",\"User\":");
+    try writeJsonString(w, bc.user);
+    try w.writeAll("}}");
+    return aw.written();
+}
+
+fn writeJsonStrArray(w: *std.Io.Writer, items: []const []const u8) !void {
+    try w.writeByte('[');
+    for (items, 0..) |s, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try writeJsonString(w, s);
+    }
+    try w.writeByte(']');
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
 }
 
 /// Derive a default rootfs dir from an image ref: the name after the last '/',
