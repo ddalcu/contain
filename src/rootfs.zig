@@ -58,7 +58,7 @@ pub fn buildShellInit(arena: std.mem.Allocator, opts: ShellInitOpts) ![]const u8
         \\
     );
     if (opts.share_guest_path) |gp|
-        try w.print("mkdir -p {s} 2>/dev/null\nmount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ gp, gp });
+        try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ gp, gp, gp });
     for (opts.env) |e| try w.print("export \"{s}\"\n", .{e});
     if (opts.workdir) |d| try w.print("cd {s} 2>/dev/null\n", .{d});
     // setsid -c gives the shell the console as its controlling terminal (job

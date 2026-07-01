@@ -18,6 +18,7 @@ test {
     _ = @import("devices/cmos.zig");
     _ = @import("kernel_fetch.zig");
     _ = @import("session.zig");
+    _ = @import("devices/virtio_fs.zig");
 }
 
 test "run args: docker-style flags, positional image + command, volume/env" {
@@ -356,7 +357,8 @@ test "rootfs: buildShellInit mounts the share, applies env, and drops to a shell
     });
     try std.testing.expect(std.mem.startsWith(u8, script, "#!/bin/sh"));
     try std.testing.expect(std.mem.indexOf(u8, script, "/workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "9p2000.L") != null); // 9p share mount
+    try std.testing.expect(std.mem.indexOf(u8, script, "virtiofs") != null); // virtio-fs share mount
+    try std.testing.expect(std.mem.indexOf(u8, script, "9p2000.L") != null); // with 9p fallback
     try std.testing.expect(std.mem.indexOf(u8, script, "FOO=bar") != null); // env applied
     try std.testing.expect(std.mem.indexOf(u8, script, "/bin/sh") != null); // exec a shell
     // Runs dash (/bin/sh), NOT interactive bash: bash's readline escapes + job
@@ -364,8 +366,9 @@ test "rootfs: buildShellInit mounts the share, applies env, and drops to a shell
     try std.testing.expect(std.mem.indexOf(u8, script, "setsid -c /bin/sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "/bin/bash") == null);
 
-    // With no share configured, the 9p mount line is omitted.
+    // With no share configured, the share mount line is omitted.
     const no_share = try rootfs.buildShellInit(arena.allocator(), .{});
+    try std.testing.expect(std.mem.indexOf(u8, no_share, "virtiofs") == null);
     try std.testing.expect(std.mem.indexOf(u8, no_share, "9p2000.L") == null);
 }
 

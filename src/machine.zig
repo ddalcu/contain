@@ -2,6 +2,7 @@
 //! exposes as `-M virt` so stock aarch64 kernels boot unmodified.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Bus = @import("bus.zig").Bus;
 const IrqLine = @import("devices/gicv2.zig").IrqLine;
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
@@ -13,6 +14,7 @@ const mptable = @import("x86/mptable.zig");
 const VirtioBlk = @import("devices/virtio.zig").VirtioBlk;
 const VirtioRng = @import("devices/virtio_rng.zig").VirtioRng;
 const Virtio9p = @import("devices/virtio_9p.zig").Virtio9p;
+const VirtioFs = @import("devices/virtio_fs.zig").VirtioFs;
 const VirtioNet = @import("devices/virtio_net.zig").VirtioNet;
 const Nat = @import("net/nat.zig").Nat;
 
@@ -62,6 +64,7 @@ pub const Machine = struct {
     disk: []u8,
     rng: *VirtioRng,
     p9: ?*Virtio9p = null,
+    vfs: ?*VirtioFs = null,
     net: ?*VirtioNet = null,
     natp: ?*Nat = null,
     net_io: ?*std.Io.Threaded = null,
@@ -97,6 +100,7 @@ pub const Machine = struct {
         self.x86_start_info = 0;
         self.x86_cmdline = null;
         self.p9 = null;
+        self.vfs = null;
         self.net = null;
         self.natp = null;
         self.net_io = null;
@@ -188,26 +192,17 @@ pub const Machine = struct {
             vidx += 1;
         }
 
-        // Optional virtio-9p sharing a host directory.
+        // Optional host-directory share: virtio-fs by default (POSIX-complete,
+        // memory-lean), or legacy 9p if CONTAIN_SHARE_FS=9p.
         if (share_path) |sp| {
             if (std.Io.Dir.cwd().openDir(io, sp, .{ .iterate = true })) |dir| {
                 var d = dir;
                 d.close(io); // just verifying it exists; the device uses cwd-relative paths
                 const slot = virtio_base + virtio_stride * vidx;
-                const p9 = try alloc.create(Virtio9p);
-                p9.* = Virtio9p.init(slot, 32 + virtio_spi + vidx, &self.bus, gic, io, sp, alloc);
-                self.p9 = p9;
-                try self.bus.addDevice(.{
-                    .base = slot,
-                    .size = Virtio9p.size,
-                    .ctx = p9,
-                    .readFn = p9Read,
-                    .writeFn = p9Write,
-                    .name = "virtio-9p",
-                });
+                try self.addShareDevice(alloc, io, gic, slot, 32 + virtio_spi + vidx, sp);
                 vidx += 1;
             } else |err| {
-                std.debug.print("[contain] 9p share '{s}' unavailable: {s}\n", .{ sp, @errorName(err) });
+                std.debug.print("[contain] share '{s}' unavailable: {s}\n", .{ sp, @errorName(err) });
             }
         }
 
@@ -240,6 +235,37 @@ pub const Machine = struct {
         return self;
     }
 
+    /// Create the host-directory share device at `slot`/`irq` and register it on
+    /// the bus. Uses virtio-fs (FUSE) by default; CONTAIN_SHARE_FS=9p selects the
+    /// legacy 9p transport. Both are virtio-mmio, so the DTB/cmdline node is
+    /// identical either way — only the guest-side `mount -t` differs (the init
+    /// scripts try virtiofs then 9p).
+    fn addShareDevice(self: *Machine, alloc: std.mem.Allocator, io: std.Io, gic: *Gicv2, slot: u64, irq: u32, path: []const u8) !void {
+        const win: u64 = if (self.platform == .x86_microvm) x86_virtio_size else VirtioFs.size;
+        if (useVirtiofs(alloc)) {
+            const vfs = try alloc.create(VirtioFs);
+            vfs.* = try VirtioFs.init(slot, irq, &self.bus, gic, io, path, "host", alloc);
+            self.vfs = vfs;
+            try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = vfs, .readFn = vfsRead, .writeFn = vfsWrite, .name = "virtio-fs" });
+        } else {
+            const p9 = try alloc.create(Virtio9p);
+            p9.* = Virtio9p.init(slot, irq, &self.bus, gic, io, path, alloc);
+            self.p9 = p9;
+            try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = p9, .readFn = p9Read, .writeFn = p9Write, .name = "virtio-9p" });
+        }
+    }
+
+    /// Default the host share to virtio-fs; CONTAIN_SHARE_FS=9p forces legacy 9p.
+    /// (Env override honored on POSIX hosts; Windows always gets the virtio-fs
+    /// default, which is the target transport there anyway.)
+    fn useVirtiofs(alloc: std.mem.Allocator) bool {
+        _ = alloc;
+        if (builtin.os.tag != .windows) {
+            if (std.posix.getenv("CONTAIN_SHARE_FS")) |v| return !std.mem.eql(u8, v, "9p");
+        }
+        return true;
+    }
+
     fn appendVirtioCmd(cmd: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, base: u64, gsi: u32) !void {
         var buf: [80]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, " virtio_mmio.device=0x{x}@0x{x}:{d}", .{ x86_virtio_size, base, gsi }) catch return;
@@ -263,6 +289,7 @@ pub const Machine = struct {
         self.x86_start_info = 0;
         self.x86_cmdline = null;
         self.p9 = null;
+        self.vfs = null;
         self.net = null;
         self.natp = null;
         self.net_io = null;
@@ -332,21 +359,19 @@ pub const Machine = struct {
             vidx += 1;
         }
 
-        // Optional virtio-9p host share.
+        // Optional host-directory share: virtio-fs by default, or legacy 9p if
+        // CONTAIN_SHARE_FS=9p.
         if (share_path) |sp| {
             if (std.Io.Dir.cwd().openDir(io, sp, .{ .iterate = true })) |dir| {
                 var d = dir;
                 d.close(io);
                 const slot = x86_virtio_base + x86_virtio_stride * vidx;
                 const gsi = x86_virtio_gsi0 + vidx;
-                const p9 = try alloc.create(Virtio9p);
-                p9.* = Virtio9p.init(slot, gsi, &self.bus, gic, io, sp, alloc);
-                self.p9 = p9;
-                try self.bus.addDevice(.{ .base = slot, .size = x86_virtio_size, .ctx = p9, .readFn = p9Read, .writeFn = p9Write, .name = "virtio-9p" });
+                try self.addShareDevice(alloc, io, gic, slot, gsi, sp);
                 try appendVirtioCmd(&cmd, alloc, slot, gsi);
                 vidx += 1;
             } else |err| {
-                std.debug.print("[contain] 9p share '{s}' unavailable: {s}\n", .{ sp, @errorName(err) });
+                std.debug.print("[contain] share '{s}' unavailable: {s}\n", .{ sp, @errorName(err) });
             }
         }
 
@@ -411,6 +436,10 @@ pub const Machine = struct {
             p9.fids.deinit();
             self.alloc.destroy(p9);
         }
+        if (self.vfs) |vfs| {
+            vfs.deinit();
+            self.alloc.destroy(vfs);
+        }
         if (self.net) |net| self.alloc.destroy(net);
         if (self.natp) |natp| {
             natp.deinit();
@@ -445,6 +474,12 @@ pub const Machine = struct {
     }
     fn p9Write(ctx: *anyopaque, offset: u64, value: u64, sz: u8) void {
         @as(*Virtio9p, @ptrCast(@alignCast(ctx))).write(offset, value, sz);
+    }
+    fn vfsRead(ctx: *anyopaque, offset: u64, sz: u8) u64 {
+        return @as(*VirtioFs, @ptrCast(@alignCast(ctx))).read(offset, sz);
+    }
+    fn vfsWrite(ctx: *anyopaque, offset: u64, value: u64, sz: u8) void {
+        @as(*VirtioFs, @ptrCast(@alignCast(ctx))).write(offset, value, sz);
     }
     fn netRead(ctx: *anyopaque, offset: u64, sz: u8) u64 {
         return @as(*VirtioNet, @ptrCast(@alignCast(ctx))).read(offset, sz);

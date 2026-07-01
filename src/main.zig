@@ -155,8 +155,9 @@ const default_init =
     \\/bin/busybox --install -s /bin
     \\export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root TERM=linux
     \\for m in /virtio_mmio.ko /virtio_blk.ko /netfs.ko /fscache.ko /9pnet.ko /9pnet_virtio.ko /9p.ko; do [ -f $m ] && insmod $m 2>/dev/null; done
-    \\# bring up the host directory mount and networking for whoever uses the guest
-    \\mount -t 9p -o trans=virtio,version=9p2000.L host /host 2>/dev/null
+    \\# bring up the host directory mount and networking for whoever uses the guest.
+    \\# virtio-fs is the default transport; fall back to 9p if only that device exists.
+    \\mount -t virtiofs host /host 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host /host 2>/dev/null
     \\ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
     \\route add default gw 10.0.2.2 2>/dev/null
     \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
@@ -184,12 +185,12 @@ const default_init =
     \\  echo CONTAIN_PERSIST_MARKER_42 | dd of=/dev/vda bs=64 count=1 conv=notrunc 2>/dev/null; sync; \
     \\  echo "wrote marker; sector 0 now: [$(dd if=/dev/vda bs=32 count=1 2>/dev/null | tr -d '\0')]"; \
     \\  else echo "no /dev/vda (virtio module not loaded)"; fi
-    \\echo "--- virtio-9p host directory mount ---"
+    \\echo "--- host directory mount (virtio-fs / 9p) ---"
     \\if mount | grep -q /host; then \
-    \\  echo "mounted host dir at /host:"; ls -la /host; \
+    \\  echo "mounted host dir at /host via $(mount | grep /host | awk '{print $5}'):"; ls -la /host; \
     \\  for f in /host/*; do [ -f "$f" ] && echo "--- $f ---" && cat "$f"; done; \
     \\  echo "writing /host/from_guest.txt..."; echo "written by the contain guest" > /host/from_guest.txt 2>/dev/null && echo "wrote ok"; \
-    \\  else echo "9p mount failed"; fi
+    \\  else echo "host mount failed"; fi
     \\echo "--- network (virtio-net + NAT) ---"
     \\ping -c 2 -W 2 10.0.2.2 2>&1 | head -3
     \\echo "--- DNS lookup (example.com) ---"; nslookup example.com 2>&1 | head -8
@@ -768,7 +769,7 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
     );
     // -v host:container -> mount the shared host directory at the container path.
     if (opts.volume_host != null)
-        try w.print("mkdir -p {s} 2>/dev/null\nmount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest });
+        try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest, opts.volume_guest });
     // Image env first, then -e/--env (so a user -e overrides the image's value).
     for (cfg.env) |e| try w.print("export \"{s}\"\n", .{e});
     for (opts.env) |e| try w.print("export \"{s}\"\n", .{e});
