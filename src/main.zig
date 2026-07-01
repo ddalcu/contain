@@ -1439,17 +1439,17 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
                 };
                 if (term != .exited or term.exited != 0) {
                     std.debug.print("contain build: RUN step subprocess failed\n", .{});
-                    return;
+                    std.process.exit(1);
                 }
                 const st = cwd.readFileAlloc(io, status_path, gpa, .limited(64)) catch {
                     std.debug.print("contain build: RUN did not report an exit status (guest crashed?)\n", .{});
-                    return;
+                    std.process.exit(1);
                 };
                 defer gpa.free(st);
                 const code = std.fmt.parseInt(u32, std.mem.trim(u8, st, " \t\r\n"), 10) catch 1;
                 if (code != 0) {
                     std.debug.print("contain build: RUN '{s}' exited with status {d}\n", .{ shell_cmd, code });
-                    return;
+                    std.process.exit(@truncate(code)); // docker-style nonzero exit on RUN failure
                 }
             },
             .copy, .add => {
