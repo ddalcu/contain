@@ -23,12 +23,12 @@ fi
 cd ..
 ./zig-out/bin/contain mkinitramfs artifacts/busybox artifacts/initramfs.cpio
 echo
-echo "built demo artifacts. The kernel (artifacts/Image-arm64) auto-fetches on first run."
+echo "built demo artifacts. The kernel (artifacts/kernel-contain-arm64) auto-fetches on first run."
 echo
 echo "Full demo (shell + 9p host mount + networking + persistent disk):"
 echo "  mkdir -p artifacts/share; echo hello > artifacts/share/readme.txt"
 echo "  head -c 16777216 /dev/zero > artifacts/disk.img"
-echo "  ./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio '' artifacts/disk.img artifacts/share"
+echo "  ./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio '' artifacts/disk.img artifacts/share"
 echo
 echo "For the x86 hardware backends (KVM on x86 Linux, WHP on Windows) build the x86 guest:"
-echo "  ./tools/build_x86_kernel.sh   # -> artifacts/{vmlinux-contain, initramfs-x86.cpio}"
+echo "  ./tools/build_x86_kernel.sh   # -> artifacts/{kernel-contain-x86_64, initramfs-x86.cpio}"

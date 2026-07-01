@@ -59,6 +59,13 @@ contain run -p 8080:3000 node:22-alpine \
 
 # Everything together (an interactive dev sandbox, Docker-style)
 contain run -it -p 8080:8080 -v ./code:/app python:3-alpine
+
+# Build an image from a Dockerfile — a drop-in for `docker build`
+contain build -t myapp .
+contain run myapp
+
+# Run a multi-service compose.yaml — `contain compose up` / `build` / `config`
+contain compose up
 ```
 
 The flags mirror `docker run`:
@@ -66,7 +73,7 @@ The flags mirror `docker run`:
 | flag | meaning |
 |---|---|
 | `-i`, `-t`, `-it` | interactive shell (attach your terminal); exit the shell to power off |
-| `-v <host>:<container>` | mount a host directory at the container path (read-write, via 9p) |
+| `-v <host>:<container>` | mount a host directory at the container path (read-write, via virtio-fs; 9p on arm64) |
 | `-p <host>:<guest>` | publish a guest TCP port on the host's `127.0.0.1` (repeatable) |
 | `-e <KEY=VALUE>` | set an environment variable (repeatable) |
 | `-w <dir>` | working directory for the command |
@@ -92,10 +99,28 @@ image's rootfs without running it, use `contain pull <image>`. For full control
   implements the virtio-mmio transport (modern/v2, split virtqueues) and a
   virtio-blk device backed by a **host file**. The guest creates `/dev/vda` and
   disk I/O **persists to the host file across boots**.
-- **Live host-directory mounts (virtio-9p)** — `src/devices/virtio_9p.zig`
-  implements a 9P2000.L device; the guest `mount -t 9p host /host` exposes a **host
-  directory live** — it lists and reads host files and writes new files straight
-  back to the host filesystem.
+- **Live host-directory mounts (virtio-fs / FUSE)** — `src/devices/virtio_fs.zig`
+  is a from-scratch virtio-fs device speaking the FUSE low-level protocol; the guest
+  `mount -t virtiofs host /host` exposes a **host directory live** with full POSIX
+  semantics (proper inodes, symlinks, `fsync`, byte-range locks — SQLite and friends
+  work). It's the default share transport on x86; `src/devices/virtio_9p.zig` (a
+  9P2000.L device) remains the arm64 default and the `CONTAIN_SHARE_FS=9p` fallback.
+- **Memory-efficient rootfs (rootfs over virtio-fs)** — on x86, `contain run` mounts
+  the image's rootfs as the guest's real root over virtio-fs and **demand-pages** it
+  from the host, instead of packing the whole image into an in-RAM initramfs. Only
+  the pages the workload actually touches become resident, so a heavy image runs in a
+  fraction of the memory (default guest RAM is 1 GB, `-m` to change).
+- **`contain build` and `contain compose`** — `contain build -t name .` builds an
+  image from a Dockerfile (`src/build.zig`: FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/
+  ENTRYPOINT/ARG; each RUN executes in a guest over virtio-fs so steps compose).
+  `contain compose up` runs a multi-service `compose.yaml` (`src/compose.zig`), each
+  service a guest reachable via its published ports **and by service name from other
+  services** (inter-service DNS): each service gets a virtual IP that peers resolve
+  its name to (via `/etc/hosts`), and the NAT relays a peer's `vip:port` to the host
+  port that peer published — so `curl http://web:80` from one service reaches another.
+  Each container also gets its **own writable layer** (a per-container overlayfs upper
+  over the shared read-only image root), so concurrent containers of the same image
+  don't clobber each other's writes.
 - **Networking (virtio-net + userspace NAT)** — `src/devices/virtio_net.zig` +
   `src/net/nat.zig` implement a virtio-net device and a slirp-style NAT (ARP, ICMP,
   DHCP, DNS forwarding, and a TCP/UDP relay to the real host network). The guest
@@ -109,8 +134,8 @@ image's rootfs without running it, use `contain pull <image>`. For full control
   the network, and compile/run it in isolation.
 - **OCI / Docker Hub images** — `src/oci/registry.zig` does the Docker Hub token
   dance, multi-arch index, gzip-tar layers and whiteouts over `std.http.Client` TLS,
-  with no docker, skopeo or external tools; the unpacked rootfs is packed into the
-  initramfs and booted on the host backend.
+  with no docker, skopeo or external tools; the unpacked rootfs is mounted over
+  virtio-fs (x86) or packed into the initramfs (arm64) and booted on the host backend.
 
 ## Hardware virtualization (HVF / KVM / WHP)
 
@@ -124,8 +149,8 @@ run; to build + boot a guest kernel by hand:
 
 ```sh
 # x86 Linux (KVM) or Windows (WHP): build the guest kernel, then boot it.
-./tools/build_x86_kernel.sh                 # -> artifacts/vmlinux-contain
-./zig-out/bin/contain boot artifacts/vmlinux-contain artifacts/initramfs-x86.cpio - \
+./tools/build_x86_kernel.sh                 # -> artifacts/kernel-contain-x86_64
+./zig-out/bin/contain boot artifacts/kernel-contain-x86_64 artifacts/initramfs-x86.cpio - \
     artifacts/disk.img artifacts/share
 ```
 
@@ -159,25 +184,25 @@ persistent disk):
 ./tools/fetch_artifacts.sh
 mkdir -p artifacts/share && echo "hello from the host" > artifacts/share/readme.txt
 head -c 16777216 /dev/zero > artifacts/disk.img
-./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio '' artifacts/disk.img artifacts/share
+./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio '' artifacts/disk.img artifacts/share
 # the guest boots a 6.1 kernel, mounts the host dir over 9p, gets an IP via the
 # NAT, resolves DNS and fetches a page off the internet, and persists /dev/vda.
 
 # drive it like an agent would, by feeding a command script as console input:
 printf 'uname -a\nls /host\nwget -O - http://example.com/\n' > cmds.txt
-./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio cmds.txt '' artifacts/share
+./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio cmds.txt '' artifacts/share
 ```
 
 **Interactive shell** — put `tty` in the input slot to attach your real
 terminal and get a live `/ #` prompt (with `/host` mounted and networking up):
 ```sh
-./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio tty '' artifacts/share
+./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio tty '' artifacts/share
 # type commands; `poweroff -f` (or `exit`) leaves and writes the disk back.
 ```
 
 > **Windows / PowerShell:** PowerShell drops empty `''` arguments to native
 > programs, so use `-` to skip a positional slot, e.g.
-> `./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio tty - artifacts/share`
+> `./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio tty - artifacts/share`
 
 **A full Alpine rootfs with Node.js 24** — boot a proper Alpine aarch64
 userspace (instead of the busybox-only initramfs) with Node 24 LTS, npm, bash,
@@ -188,7 +213,7 @@ curl and ca-certificates preinstalled, and expose a guest server to the host:
 ./tools/build_alpine_node.sh                 # -> artifacts/alpine-node.cpio.gz
 
 # interactive shell with host port 8080 forwarded to the guest's port 8080
-./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/alpine-node.cpio.gz tty - - 8080
+./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/alpine-node.cpio.gz tty - - 8080
 #   inside the guest:  node -e 'require("http").createServer((q,s)=>s.end("hi")).listen(8080,"0.0.0.0")'
 #   then on the host:  curl http://127.0.0.1:8080
 ```

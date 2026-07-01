@@ -2,7 +2,7 @@
 # Build the x86-64 guest artifacts for contain's x86-microvm platform (the KVM and
 # WHP backends): the PVH guest kernel + a busybox demo initramfs. Run on an x86-64
 # Linux host (or WSL2). Produces:
-#   artifacts/vmlinux-contain     - PVH kernel (linux, virtio-mmio + 9p + 8250)
+#   artifacts/kernel-contain-x86_64     - PVH kernel (linux, virtio-mmio + 9p + 8250)
 #   artifacts/busybox-x86         - static x86-64 busybox
 #   artifacts/initramfs-x86.cpio  - demo initramfs (busybox + the embedded /init)
 #
@@ -53,7 +53,7 @@ $cfg --set-val NR_CPUS 1
 make CC="$CC" HOSTCC="$HOSTCC" olddefconfig
 echo "=== building vmlinux (takes a few minutes) ==="
 make CC="$CC" HOSTCC="$HOSTCC" -j"$(nproc)" vmlinux
-cp vmlinux "$REPO/artifacts/vmlinux-contain"
+cp vmlinux "$REPO/artifacts/kernel-contain-x86_64"
 readelf -n vmlinux | grep -qi xen || { echo "ERROR: no PVH note (CONFIG_PVH missing)"; exit 1; }
 
 # --- busybox + demo initramfs ---
@@ -68,6 +68,6 @@ fi
 [ -x zig-out/bin/contain ] || zig build
 ./zig-out/bin/contain mkinitramfs artifacts/busybox-x86 artifacts/initramfs-x86.cpio
 
-echo "DONE — artifacts/{vmlinux-contain, busybox-x86, initramfs-x86.cpio}"
-echo "  boot:  ./zig-out/bin/contain boot artifacts/vmlinux-contain artifacts/initramfs-x86.cpio -"
+echo "DONE — artifacts/{kernel-contain-x86_64, busybox-x86, initramfs-x86.cpio}"
+echo "  boot:  ./zig-out/bin/contain boot artifacts/kernel-contain-x86_64 artifacts/initramfs-x86.cpio -"
 echo "  run:   ./zig-out/bin/contain run alpine cat /etc/os-release"

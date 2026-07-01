@@ -68,7 +68,7 @@ Handoff doc for a fresh-context agent. Two independent workstreams:
    boot/Node workloads (not just the microbenchmark).
 
 Build/test as usual: `zig build test` (fast, no artifacts), and for boot-level
-changes `zig build -Doptimize=ReleaseFast` then boot `artifacts/Image-arm64` with
+changes `zig build -Doptimize=ReleaseFast` then boot `artifacts/kernel-contain-arm64` with
 `artifacts/node-min.cpio`. See CLAUDE.md.
 
 ---

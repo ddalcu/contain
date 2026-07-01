@@ -11,6 +11,8 @@ const cpio = @import("cpio.zig");
 const registry = @import("oci/registry.zig");
 const rootfs = @import("rootfs.zig");
 const kernel_fetch = @import("kernel_fetch.zig");
+const build_mod = @import("build.zig");
+const compose_mod = @import("compose.zig");
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
 const Uart16550 = @import("devices/uart_16550.zig").Uart16550;
 
@@ -155,8 +157,9 @@ const default_init =
     \\/bin/busybox --install -s /bin
     \\export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root TERM=linux
     \\for m in /virtio_mmio.ko /virtio_blk.ko /netfs.ko /fscache.ko /9pnet.ko /9pnet_virtio.ko /9p.ko; do [ -f $m ] && insmod $m 2>/dev/null; done
-    \\# bring up the host directory mount and networking for whoever uses the guest
-    \\mount -t 9p -o trans=virtio,version=9p2000.L host /host 2>/dev/null
+    \\# bring up the host directory mount and networking for whoever uses the guest.
+    \\# virtio-fs is the default transport; fall back to 9p if only that device exists.
+    \\mount -t virtiofs host /host 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host /host 2>/dev/null
     \\ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
     \\route add default gw 10.0.2.2 2>/dev/null
     \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
@@ -184,12 +187,12 @@ const default_init =
     \\  echo CONTAIN_PERSIST_MARKER_42 | dd of=/dev/vda bs=64 count=1 conv=notrunc 2>/dev/null; sync; \
     \\  echo "wrote marker; sector 0 now: [$(dd if=/dev/vda bs=32 count=1 2>/dev/null | tr -d '\0')]"; \
     \\  else echo "no /dev/vda (virtio module not loaded)"; fi
-    \\echo "--- virtio-9p host directory mount ---"
+    \\echo "--- host directory mount (virtio-fs / 9p) ---"
     \\if mount | grep -q /host; then \
-    \\  echo "mounted host dir at /host:"; ls -la /host; \
+    \\  echo "mounted host dir at /host via $(mount | grep /host | awk '{print $5}'):"; ls -la /host; \
     \\  for f in /host/*; do [ -f "$f" ] && echo "--- $f ---" && cat "$f"; done; \
     \\  echo "writing /host/from_guest.txt..."; echo "written by the contain guest" > /host/from_guest.txt 2>/dev/null && echo "wrote ok"; \
-    \\  else echo "9p mount failed"; fi
+    \\  else echo "host mount failed"; fi
     \\echo "--- network (virtio-net + NAT) ---"
     \\ping -c 2 -W 2 10.0.2.2 2>&1 | head -3
     \\echo "--- DNS lookup (example.com) ---"; nslookup example.com 2>&1 | head -8
@@ -204,6 +207,13 @@ const default_init =
 // touched pages — this just raises the ceiling so larger OCI images (whose rootfs
 // rides in the initramfs) have headroom for the tmpfs copy + the workload.
 pub const default_ram: usize = 2 * 1024 * 1024 * 1024;
+
+/// Default guest RAM when the rootfs is mounted over virtio-fs (demand-paged) —
+/// the image is NOT resident in RAM, so this is pure workload headroom, not
+/// image+headroom. A smaller window also caps the guest page cache (which grows
+/// to fill free RAM and, being host-resident once touched, would otherwise inflate
+/// host RSS toward the full window). Overridable with -m / CONTAIN_MEM.
+pub const default_ram_virtiofs: usize = 1024 * 1024 * 1024; // 1 GB
 
 // Ceiling on a directly-`boot`ed initramfs file read. Auto-sized guest RAM (see
 // ramForInitrd) lets a multi-GB rootfs ride in the initramfs, so the read cap has
@@ -285,6 +295,15 @@ pub fn main(init: std.process.Init) !void {
     const accel_override = init.environ_map.get("CONTAIN_ACCEL");
     // CONTAIN_MEM overrides the auto-sized guest RAM (e.g. "4G"); `run -m` beats it.
     const mem_override = init.environ_map.get("CONTAIN_MEM");
+    // CONTAIN_SHARE_FS=9p forces the legacy 9p transport for host-directory shares
+    // (default is virtio-fs on x86). Set the process-wide flag machine.zig reads.
+    if (init.environ_map.get("CONTAIN_SHARE_FS")) |v|
+        machine_mod.Machine.share_9p_override = std.mem.eql(u8, v, "9p");
+    // CONTAIN_ROOTFS=initramfs forces the legacy rootfs-in-initramfs pack instead of
+    // rootfs-over-virtiofs (default on x86). Read here where the env map is available.
+    force_initramfs_root = if (init.environ_map.get("CONTAIN_ROOTFS")) |v| std.mem.eql(u8, v, "initramfs") else false;
+    // CONTAIN_OVERLAY=0 disables per-container overlay isolation (default on).
+    overlay_isolation = if (init.environ_map.get("CONTAIN_OVERLAY")) |v| !std.mem.eql(u8, v, "0") else true;
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "boot")) {
@@ -292,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         }
-        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null);
+        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null, null, null);
     } else if (std.mem.eql(u8, cmd, "mkinitramfs")) {
         if (args.len < 4) {
             usage();
@@ -322,6 +341,16 @@ pub fn main(init: std.process.Init) !void {
         };
         const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
         try cmdRunOci(gpa, io, opts, cache_base);
+    } else if (std.mem.eql(u8, cmd, "build")) {
+        const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
+        try cmdBuild(gpa, io, args[2..], cache_base);
+    } else if (std.mem.eql(u8, cmd, "compose")) {
+        const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
+        try cmdCompose(gpa, io, args[2..], cache_base);
+    } else if (std.mem.eql(u8, cmd, "__buildstep")) {
+        // Internal: one `contain build` RUN step (spawned as a subprocess).
+        if (args.len < 3) return;
+        try cmdBuildStep(gpa, io, args[2]);
     } else {
         usage();
     }
@@ -423,6 +452,13 @@ fn usage() void {
         \\    --rm, --name, -u/--user             accepted for docker-compat (ignored)
         \\    -d, --detach                        unsupported (runs in foreground)
         \\
+        \\  contain build [-t NAME[:TAG]] [-f DOCKERFILE] CONTEXT
+        \\                                build an image from a Dockerfile (FROM/RUN/
+        \\                                COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT/ARG);
+        \\                                run it with `contain run NAME` (x86 only)
+        \\  contain compose [-f FILE] up|build|config [SERVICE...]
+        \\                                run a multi-service compose.yaml (each
+        \\                                service is a guest; published ports only)
         \\  contain pull <image> [dir] [arch]   unpack an image's rootfs to <dir>
         \\                                      (default: ./<image>-rootfs)
         \\  contain boot <kernel> [initramfs] [input] [disk] [share] [ports]
@@ -457,6 +493,39 @@ fn setupForwards(m: *Machine, spec: []const u8) void {
         };
         std.debug.print("[contain] forwarding host 127.0.0.1:{d} -> guest :{d}\n", .{ host, guest });
     }
+}
+
+/// Parse a comma-separated list of compose inter-service forwards, each
+/// "A.B.C.D:cport:hport", and register them on the machine's NAT. The guest
+/// reaches a peer service at its virtual IP (resolved via /etc/hosts) and the
+/// NAT relays to 127.0.0.1:hport where that peer published its container port.
+fn setupServiceForwards(m: *Machine, spec: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, spec, ',');
+    while (it.next()) |tok| {
+        // Split off the two trailing ":cport:hport" fields; the rest is the IP.
+        const c2 = std.mem.lastIndexOfScalar(u8, tok, ':') orelse continue;
+        const c1 = std.mem.lastIndexOfScalar(u8, tok[0..c2], ':') orelse continue;
+        const vip = parseIpv4(tok[0..c1]) orelse continue;
+        const cport = std.fmt.parseInt(u16, tok[c1 + 1 .. c2], 10) catch continue;
+        const hport = std.fmt.parseInt(u16, tok[c2 + 1 ..], 10) catch continue;
+        m.addServiceForward(vip, cport, hport) catch |err| {
+            std.debug.print("[contain] service-forward {s} failed: {s}\n", .{ tok, @errorName(err) });
+            continue;
+        };
+    }
+}
+
+/// Parse a dotted-quad IPv4 literal ("10.0.2.100") into 4 octets, or null.
+fn parseIpv4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var n: usize = 0;
+    while (it.next()) |part| {
+        if (n >= 4) return null;
+        out[n] = std.fmt.parseInt(u8, part, 10) catch return null;
+        n += 1;
+    }
+    return if (n == 4) out else null;
 }
 
 const X86StdinCtx = struct { uart: *Uart16550, io: std.Io, stop: *std.atomic.Value(bool), m: *Machine };
@@ -543,7 +612,7 @@ fn runMachineTimed(io: std.Io, kind: accel.Kind, m: *Machine) f64 {
 }
 
 /// Boot an x86-64 `vmlinux` on the x86-microvm platform via a hardware backend.
-fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize) !void {
+fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, rootfs_share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize, svc_spec: ?[]const u8) !void {
     // x86-microvm only runs on a hardware backend: WHP on Windows, KVM elsewhere.
     // An explicit CONTAIN_ACCEL=kvm|whp overrides the host default.
     const host_default: accel.Kind = if (builtin.os.tag == .windows) .whp else .kvm;
@@ -560,7 +629,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     var rng_seed: [64]u8 = undefined;
     if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
 
-    var m = try Machine.initX86(gpa, io, ram_size, share, true, rng_seed[0..32].*, kind == .whp);
+    var m = try Machine.initX86(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*, kind == .whp);
     defer m.deinit();
     m.input = input;
 
@@ -570,6 +639,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
 
     loadDisk(io, gpa, m, disk);
     if (ports_spec) |ps| if (!isNone(ps)) setupForwards(m, ps);
+    if (svc_spec) |ss| if (!isNone(ss)) setupServiceForwards(m, ss);
 
     var stop = std.atomic.Value(bool).init(false);
     var stdin_ctx: X86StdinCtx = .{ .uart = m.uart16550.?, .io = io, .stop = &stop, .m = m };
@@ -584,7 +654,40 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     std.process.exit(0);
 }
 
-fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8) !void {
+/// Internal `contain __buildstep <rootfs_dir>` entry: boot a rootfs dir over
+/// virtio-fs, run its `/.contain-init`, and process.exit(0). `contain build` spawns
+/// this as a SUBPROCESS per RUN step, rather than booting in-process, because a
+/// network-heavy RUN (apk/pip/npm) leaves the NAT's blocking reader threads pending
+/// and joining them in Machine.deinit can hang (the same reason bootX86 exits rather
+/// than returns). A fresh process per step gets the clean process.exit teardown and
+/// the step's writes still persist to the shared build rootfs. x86 only.
+fn cmdBuildStep(gpa: std.mem.Allocator, io: std.Io, rootfs_dir: []const u8) !void {
+    const kind = accel.fromEnvOrDefault(null);
+    const eff: accel.Kind = switch (kind) {
+        .kvm, .whp => kind,
+        else => accel.autoDefault(),
+    };
+    if (!accel.supported(eff)) {
+        std.debug.print("contain __buildstep: no x86 backend available\n", .{});
+        std.process.exit(1);
+    }
+    const kpath = kernel_fetch.resolveKernelPath(gpa, io) catch kernel_fetch.defaultKernelPath();
+    const vmlinux = std.Io.Dir.cwd().readFileAlloc(io, kpath, gpa, .limited(128 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain __buildstep: cannot read kernel: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var rng_seed: [64]u8 = undefined;
+    if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
+
+    const m = try Machine.initX86(gpa, io, default_ram_virtiofs, null, rootfs_dir, true, rng_seed[0..32].*, eff == .whp);
+    m.input = "";
+    try m.bootPvh(vmlinux, null);
+    _ = runMachineTimed(io, eff, m);
+    std.process.exit(0); // clean teardown (skip the potentially-hanging NAT join)
+}
+
+fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8, svc_spec: ?[]const u8) !void {
     // Auto-fetch the guest kernel when the canonical default is missing (arm64
     // only — x86 builds it from source). Scoped to the default path so a custom
     // `boot <kernel>` never gets silently overwritten with the Kata kernel.
@@ -638,6 +741,8 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
             std.debug.print("contain: invalid memory size '{s}' (use e.g. 4G, 512M, or a byte count)\n", .{ms});
             return;
         }
+    else if (rootfs_share != null)
+        default_ram_virtiofs // demand-paged root: size to the workload, not the image
     else
         ramForInitrd(if (initrd) |ir| ir.len else 0);
 
@@ -652,7 +757,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     // An ELF kernel image means a `vmlinux` -> the x86-microvm platform (PVH boot,
     // in-kernel irqchip, 16550 console). Only the hardware backends can run it.
     if (image.len >= 4 and std.mem.eql(u8, image[0..4], "\x7fELF")) {
-        try bootX86(gpa, io, image, initrd, input, disk, share, ports_spec, accel_override, interactive, ram_size);
+        try bootX86(gpa, io, image, initrd, input, disk, share, rootfs_share, ports_spec, accel_override, interactive, ram_size, svc_spec);
         return;
     }
 
@@ -671,7 +776,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     const rng_seed = seedRng();
     const have_seed = builtin.os.tag == .macos;
 
-    var m = try Machine.init(gpa, io, ram_size, share, true, rng_seed[0..32].*); // networking on
+    var m = try Machine.init(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*); // networking on
     defer m.deinit();
 
     const dtb = try fdt.buildVirtDtb(gpa, .{
@@ -706,6 +811,8 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
 
     // Optional host->guest port forwards (e.g. expose a guest web app).
     if (ports_spec) |ps| if (!isNone(ps)) setupForwards(m, ps);
+    // Optional compose inter-service forwards (peer service vip:cport relays).
+    if (svc_spec) |ss| if (!isNone(ss)) setupServiceForwards(m, ss);
 
     // Interactive: attach the host terminal to the guest console.
     var stop = std.atomic.Value(bool).init(false);
@@ -749,7 +856,7 @@ fn shellQuote(w: *std.Io.Writer, arg: []const u8) !void {
     try w.writeAll("' ");
 }
 
-fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts) ![]const u8 {
+pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, overlay_root: bool, epoch: i64) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.writeAll(
@@ -759,6 +866,43 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\mount -t proc proc /proc 2>/dev/null
         \\mount -t sysfs sysfs /sys 2>/dev/null
         \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
+        \\
+    );
+    // Per-container writable layer. Concurrent containers of the same image share
+    // one read-only image rootfs on the host; give each its own private tmpfs
+    // upper layer (overlayfs) so their writes never collide, then pivot into it.
+    // Everything below then runs on the isolated root. Guarded end-to-end: if the
+    // kernel lacks overlayfs or the switch fails, we fall through unisolated.
+    if (overlay_root) try w.writeAll(
+        \\# --- per-container overlay isolation ---
+        \\if mkdir -p /.contain-ovl 2>/dev/null && mount -t tmpfs tmpfs /.contain-ovl 2>/dev/null; then
+        \\  mkdir -p /.contain-ovl/up /.contain-ovl/work /.contain-ovl/root
+        \\  if mount -t overlay contain -o lowerdir=/,upperdir=/.contain-ovl/up,workdir=/.contain-ovl/work /.contain-ovl/root 2>/dev/null; then
+        \\    mkdir -p /.contain-ovl/root/proc /.contain-ovl/root/sys /.contain-ovl/root/dev /.contain-ovl/root/.oldroot
+        \\    if cd /.contain-ovl/root && pivot_root . .oldroot; then
+        \\      # New root's /dev is the (empty) image /dev — mount devtmpfs FIRST so
+        \\      # /dev/null exists before anything below redirects to it; without the
+        \\      # nodes, a `2>/dev/null` here would fail and skip its own command.
+        \\      mount -t devtmpfs devtmpfs /dev
+        \\      mount -t proc proc /proc
+        \\      mount -t sysfs sysfs /sys
+        \\      cd /
+        \\    fi
+        \\  fi
+        \\fi
+        \\
+    );
+    try w.print(
+        \\# Reattach PID 1's stdio to the console. In rootfs-over-virtiofs mode the
+        \\# image's /dev has no console at exec time (unlike the kernel's initramfs),
+        \\# so without this every command's output would be lost.
+        \\exec </dev/console >/dev/console 2>&1
+        \\# Set a sane clock from the host (the guest has no working RTC), so TLS
+        \\# certificate validation works for apk/pip/npm over HTTPS.
+        \\date -s @{d} >/dev/null 2>&1 || date -u -s "@{d}" >/dev/null 2>&1
+        \\
+    , .{ epoch, epoch });
+    try w.writeAll(
         \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
         \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
         \\ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null
@@ -766,9 +910,27 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
         \\
     );
+    // Inter-service name resolution (compose): map each peer service name to its
+    // virtual IP in /etc/hosts, one line per unique service. The guest's NAT
+    // answers ARP for these IPs and relays connections to the peer's host port.
+    {
+        var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (opts.links) |lk| {
+            var dup = false;
+            for (seen.items) |nm| {
+                if (std.mem.eql(u8, nm, lk.name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try seen.append(arena, lk.name);
+            try w.print("echo \"{s} {s}\" >> /etc/hosts\n", .{ lk.vip, lk.name });
+        }
+    }
     // -v host:container -> mount the shared host directory at the container path.
     if (opts.volume_host != null)
-        try w.print("mkdir -p {s} 2>/dev/null\nmount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest });
+        try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest, opts.volume_guest });
     // Image env first, then -e/--env (so a user -e overrides the image's value).
     for (cfg.env) |e| try w.print("export \"{s}\"\n", .{e});
     for (opts.env) |e| try w.print("export \"{s}\"\n", .{e});
@@ -798,6 +960,17 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
     return aw.written();
 }
 
+/// A compose inter-service link handed to `contain run` via `--link`: the peer
+/// service `name` resolves (via the guest's /etc/hosts) to virtual IP `vip`, and
+/// the guest's NAT relays `vip:cport` to 127.0.0.1:hport where the peer published
+/// its container port. One entry per (peer service, container port).
+pub const Link = struct {
+    name: []const u8,
+    vip: []const u8, // dotted-quad, e.g. "10.0.2.100"
+    cport: u16, // the peer's container port
+    hport: u16, // the host loopback port the peer published cport on
+};
+
 /// The parsed surface of `contain run` — mirrors `docker run`.
 pub const RunOpts = struct {
     image: []const u8,
@@ -812,6 +985,7 @@ pub const RunOpts = struct {
     accel_override: ?[]const u8 = null,
     mem: ?[]const u8 = null, // -m/--memory (docker-style size, e.g. "4G"); else CONTAIN_MEM
     pull_policy: PullPolicy = .missing, // --pull [always|missing|never]
+    links: []const Link = &.{}, // --link name:vip:cport:hport (compose inter-service)
 };
 
 /// When to (re)pull an image vs. reuse the on-disk cache. `.missing` (the default)
@@ -858,6 +1032,8 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
     var opts: RunOpts = .{ .image = "", .accel_override = accel_override, .mem = mem_env };
     var ports: std.ArrayListUnmanaged([]const u8) = .empty;
     var env: std.ArrayListUnmanaged([]const u8) = .empty;
+    var links: std.ArrayListUnmanaged(Link) = .empty;
+    var cmd_hex_words: ?[]const []const u8 = null;
     var nvol: u32 = 0;
 
     const next = struct {
@@ -895,6 +1071,19 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
             opts.workdir = next(args, &i);
         } else if (eq(u8, a, "--entrypoint")) {
             opts.entrypoint = next(args, &i);
+        } else if (eq(u8, a, "--link")) {
+            // Compose inter-service link: name:vip:cport:hport. Malformed entries
+            // are skipped (best effort — this flag is emitted internally).
+            if (next(args, &i)) |v| if (parseLink(v)) |lk| try links.append(arena, lk);
+        } else if (eq(u8, a, "--cmd-hex")) {
+            // Internal: compose passes a service `command:` as a hex-encoded string
+            // so it survives the Windows argv round-trip intact (space-containing
+            // args aren't reliably re-quoted across a subprocess spawn). Decoded
+            // and shell-split here; used as the command if none is given positionally.
+            if (next(args, &i)) |v| {
+                const raw = (hexDecode(arena, v) catch null) orelse continue;
+                cmd_hex_words = try shellSplit(arena, raw);
+            }
         } else if (eq(u8, a, "--name") or eq(u8, a, "-u") or eq(u8, a, "--user")) {
             _ = next(args, &i); // accepted for docker-compat; ignored (guest runs as root)
         } else if (eq(u8, a, "--rm")) {
@@ -922,21 +1111,314 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
     }
 
     if (opts.image.len == 0) return null;
+    // A --cmd-hex command applies only when no positional command was given.
+    if (cmd_hex_words) |cw| if (opts.command.len == 0) {
+        opts.command = cw;
+    };
     opts.env = try env.toOwnedSlice(arena);
     opts.ports = if (ports.items.len == 0) null else try std.mem.join(arena, ",", ports.items);
+    opts.links = try links.toOwnedSlice(arena);
     return opts;
+}
+
+/// Decode a lowercase-hex string into its bytes (null on odd length / bad digit).
+fn hexDecode(a: std.mem.Allocator, s: []const u8) !?[]u8 {
+    if (s.len % 2 != 0) return null;
+    const out = try a.alloc(u8, s.len / 2);
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        const hi = std.fmt.charToDigit(s[i * 2], 16) catch return null;
+        const lo = std.fmt.charToDigit(s[i * 2 + 1], 16) catch return null;
+        out[i] = @as(u8, hi) * 16 + lo;
+    }
+    return out;
+}
+
+/// Encode bytes as a lowercase-hex string (inverse of hexDecode).
+pub fn hexEncode(a: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const digits = "0123456789abcdef";
+    const out = try a.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0xf];
+    }
+    return out;
+}
+
+/// Parse a `--link name:vip:cport:hport` value (e.g. "web:10.0.2.100:80:8080").
+/// Returns null on any malformed field. `vip` is kept as the original substring.
+fn parseLink(s: []const u8) ?Link {
+    const c1 = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const name = s[0..c1];
+    // The last two colons separate cport and hport; the middle is the dotted vip.
+    const c3 = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const c2 = std.mem.lastIndexOfScalar(u8, s[0..c3], ':') orelse return null;
+    if (c2 <= c1) return null;
+    const vip = s[c1 + 1 .. c2];
+    const cport = std.fmt.parseInt(u16, s[c2 + 1 .. c3], 10) catch return null;
+    const hport = std.fmt.parseInt(u16, s[c3 + 1 ..], 10) catch return null;
+    if (name.len == 0 or vip.len == 0) return null;
+    return .{ .name = name, .vip = vip, .cport = cport, .hport = hport };
 }
 
 /// `contain run [opts] <image> [cmd...]` — pull a Docker Hub image and run it in
 /// the guest. The unpacked rootfs is packed straight into the initramfs (rootfs
 /// as root), so the image's own shell/loader/binaries run directly. The host-arch
-/// kernel is chosen automatically (x86 -> vmlinux-contain, arm64 -> Image-arm64).
+/// kernel is chosen automatically (x86 -> kernel-contain-x86_64, arm64 -> kernel-contain-arm64).
 ///
 /// The image is cached under `cache_base` keyed by ref+arch: an unpacked `rootfs/`,
 /// its `config.json`, and a `.complete` marker written only after a full pull. A
 /// later run of the same ref reuses the cache with no network and no re-unpack
 /// (`--pull always` forces a refresh; `--pull never` requires the cache). Layer/
 /// config blobs are also cached by digest under `<cache_base>/blobs`.
+/// `contain compose [-f FILE] [-p PROJECT] SUBCOMMAND [SERVICE...]` — a docker-
+/// compose-style multi-service runner. SUBCOMMANDs: up (run services), build (build
+/// services that declare `build:`), config (print the parsed model), down (stop —
+/// see note). Each service becomes a `contain run` (or `contain build`) subprocess,
+/// reusing the whole pipeline. Inter-service networking is modeled: each service
+/// gets a virtual IP peers resolve its name to (via /etc/hosts) and its NAT relays
+/// vip:cport to the peer's published host loopback port (see compose_mod.planNet).
+fn cmdCompose(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cache_base: []const u8) !void {
+    _ = cache_base;
+    var file: ?[]const u8 = null;
+    var project: []const u8 = "contain";
+    var sub: []const u8 = "up";
+    var only: std.ArrayListUnmanaged([]const u8) = .empty;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var i: usize = 0;
+    var got_sub = false;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--file")) {
+            i += 1;
+            if (i < args.len) file = args[i];
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--project-name")) {
+            i += 1;
+            if (i < args.len) project = args[i];
+        } else if (a.len > 0 and a[0] == '-') {
+            // ignore other global flags (e.g. -d) for now
+        } else if (!got_sub) {
+            sub = a;
+            got_sub = true;
+        } else {
+            try only.append(arena, a);
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const path = file orelse findComposeFile(io) orelse {
+        std.debug.print("contain compose: no compose file found (compose.yaml / docker-compose.yml)\n", .{});
+        return;
+    };
+    const src = cwd.readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain compose: cannot read '{s}': {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer gpa.free(src);
+    var comp = compose_mod.parse(gpa, src) catch |err| {
+        std.debug.print("contain compose: parse error in '{s}': {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer comp.deinit();
+
+    // Order services so a service starts after the ones it depends_on.
+    const order = try orderServices(arena, comp.services);
+
+    const exe = try std.process.executablePathAlloc(io, arena);
+
+    if (std.mem.eql(u8, sub, "config")) {
+        for (comp.services) |*s| printService(s);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "down")) {
+        std.debug.print("[compose] `up` runs in the foreground; stop it with Ctrl-C to bring the project down.\n", .{});
+        return;
+    }
+    const do_build = std.mem.eql(u8, sub, "build");
+    const do_up = std.mem.eql(u8, sub, "up");
+    if (!do_build and !do_up) {
+        std.debug.print("contain compose: unknown subcommand '{s}' (use: up | build | config | down)\n", .{sub});
+        return;
+    }
+
+    // Build phase: every service that declares `build:` (both for `build` and as a
+    // prerequisite of `up`).
+    for (order) |idx| {
+        const s = &comp.services[idx];
+        if (!wanted(only.items, s.name)) continue;
+        if (s.build) |ctx| {
+            const tag = try std.fmt.allocPrint(arena, "{s}_{s}:latest", .{ project, s.name });
+            std.debug.print("[compose] building service '{s}' -> {s}\n", .{ s.name, tag });
+            var bargv: std.ArrayListUnmanaged([]const u8) = .empty;
+            try bargv.appendSlice(arena, &.{ exe, "build", "-t", tag, ctx });
+            const term = try spawnWait(io, arena, bargv.items);
+            if (term != .exited or term.exited != 0) {
+                std.debug.print("contain compose: build of '{s}' failed\n", .{s.name});
+                return;
+            }
+        }
+    }
+    if (do_build) {
+        std.debug.print("[compose] build complete.\n", .{});
+        return;
+    }
+
+    // Plan the virtual network: assign each service a virtual IP and a host port
+    // per exposed container port. This is what lets services reach each other by
+    // name (see compose_mod.planNet).
+    const plan = try compose_mod.planNet(arena, comp.services);
+    // Pre-format each service's virtual IP as a dotted-quad string (for -p/--link).
+    const vips = try arena.alloc([]const u8, comp.services.len);
+    for (plan, 0..) |ni, k| vips[k] = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{ ni.vip[0], ni.vip[1], ni.vip[2], ni.vip[3] });
+
+    // Up phase: spawn each service's `contain run`, then wait on them all. Output is
+    // inherited (interleaved). Ctrl-C on the compose process tears down the group.
+    var children: std.ArrayListUnmanaged(std.process.Child) = .empty;
+    for (order) |idx| {
+        const s = &comp.services[idx];
+        if (!wanted(only.items, s.name)) continue;
+        const image = if (s.build != null)
+            try std.fmt.allocPrint(arena, "{s}_{s}:latest", .{ project, s.name })
+        else
+            (s.image orelse {
+                std.debug.print("contain compose: service '{s}' has neither image nor build\n", .{s.name});
+                continue;
+            });
+        var rargv: std.ArrayListUnmanaged([]const u8) = .empty;
+        try rargv.appendSlice(arena, &.{ exe, "run", "--name", s.name });
+        // Publish this service's ports (both `ports:` and `expose:`) on the host
+        // loopback so peers can relay to them; the planned host port is authoritative.
+        for (plan[idx].ports) |pm|
+            try rargv.appendSlice(arena, &.{ "-p", try std.fmt.allocPrint(arena, "{d}:{d}", .{ pm.hport, pm.cport }) });
+        // Teach this service to resolve every service (including itself) by name:
+        // one --link per (peer service, container port).
+        for (comp.services, 0..) |*peer, j| {
+            for (plan[j].ports) |pm|
+                try rargv.appendSlice(arena, &.{ "--link", try std.fmt.allocPrint(arena, "{s}:{s}:{d}:{d}", .{ peer.name, vips[j], pm.cport, pm.hport }) });
+        }
+        for (s.volumes.items) |v| try rargv.appendSlice(arena, &.{ "-v", v });
+        for (s.env.items) |e| try rargv.appendSlice(arena, &.{ "-e", e });
+        // Pass the service command hex-encoded so it survives the subprocess
+        // argv round-trip (spaces/quotes aren't reliably re-quoted on Windows).
+        // `contain run` decodes + shell-splits it.
+        if (s.command) |c| try rargv.appendSlice(arena, &.{ "--cmd-hex", try hexEncode(arena, c) });
+        try rargv.append(arena, image);
+
+        std.debug.print("[compose] starting service '{s}' ({s})\n", .{ s.name, image });
+        const child = std.process.spawn(io, .{ .argv = rargv.items }) catch |err| {
+            std.debug.print("contain compose: failed to start '{s}': {s}\n", .{ s.name, @errorName(err) });
+            continue;
+        };
+        try children.append(arena, child);
+    }
+
+    for (children.items) |*ch| _ = ch.wait(io) catch {};
+    std.debug.print("[compose] all services exited.\n", .{});
+}
+
+fn wanted(only: []const []const u8, name: []const u8) bool {
+    if (only.len == 0) return true;
+    for (only) |o| if (std.mem.eql(u8, o, name)) return true;
+    return false;
+}
+
+fn spawnWait(io: std.Io, arena: std.mem.Allocator, argv: []const []const u8) !std.process.Child.Term {
+    _ = arena;
+    var child = try std.process.spawn(io, .{ .argv = argv });
+    return child.wait(io);
+}
+
+/// Topologically order services so dependencies precede dependents (best effort;
+/// falls back to declaration order on a cycle).
+fn orderServices(arena: std.mem.Allocator, services: []compose_mod.Service) ![]usize {
+    const n = services.len;
+    var started = try arena.alloc(bool, n);
+    @memset(started, false);
+    var order: std.ArrayListUnmanaged(usize) = .empty;
+    var progress = true;
+    while (order.items.len < n and progress) {
+        progress = false;
+        for (services, 0..) |*s, idx| {
+            if (started[idx]) continue;
+            var ready = true;
+            for (s.depends_on.items) |dep| {
+                // Is the dependency already ordered?
+                var found = false;
+                for (order.items) |oi| {
+                    if (std.mem.eql(u8, services[oi].name, dep)) found = true;
+                }
+                // Only block on deps that actually exist in this compose file.
+                var exists = false;
+                for (services) |*t| if (std.mem.eql(u8, t.name, dep)) {
+                    exists = true;
+                };
+                if (exists and !found) ready = false;
+            }
+            if (ready) {
+                started[idx] = true;
+                try order.append(arena, idx);
+                progress = true;
+            }
+        }
+    }
+    // Cycle fallback: append whatever's left in declaration order.
+    for (0..n) |idx| if (!started[idx]) try order.append(arena, idx);
+    return order.items;
+}
+
+fn findComposeFile(io: std.Io) ?[]const u8 {
+    const candidates = [_][]const u8{ "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml" };
+    for (candidates) |c| {
+        if (std.Io.Dir.cwd().statFile(io, c, .{})) |_| return c else |_| {}
+    }
+    return null;
+}
+
+fn printService(s: *const compose_mod.Service) void {
+    std.debug.print("service {s}:\n", .{s.name});
+    if (s.image) |im| std.debug.print("  image: {s}\n", .{im});
+    if (s.build) |b| std.debug.print("  build: {s}\n", .{b});
+    if (s.command) |c| std.debug.print("  command: {s}\n", .{c});
+    for (s.ports.items) |p| std.debug.print("  port: {s}\n", .{p});
+    for (s.expose.items) |e| std.debug.print("  expose: {s}\n", .{e});
+    for (s.volumes.items) |v| std.debug.print("  volume: {s}\n", .{v});
+    for (s.env.items) |e| std.debug.print("  env: {s}\n", .{e});
+    for (s.depends_on.items) |d| std.debug.print("  depends_on: {s}\n", .{d});
+}
+
+/// Split a command string into words, honoring single/double quotes so a compose
+/// `command: sh -c "a && b"` keeps `a && b` as one argument (the quotes group and
+/// are removed). Each resulting word is later single-quoted verbatim into the
+/// guest init, so no further escaping is needed here. No backslash escaping.
+pub fn shellSplit(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cur: std.ArrayListUnmanaged(u8) = .empty;
+    var in_word = false;
+    var quote: u8 = 0; // 0 = none, else the opening quote char
+    for (cmd) |c| {
+        if (quote != 0) {
+            if (c == quote) quote = 0 else try cur.append(a, c);
+            in_word = true;
+        } else if (c == '\'' or c == '"') {
+            quote = c;
+            in_word = true;
+        } else if (c == ' ' or c == '\t') {
+            if (in_word) {
+                try list.append(a, try cur.toOwnedSlice(a));
+                in_word = false;
+            }
+        } else {
+            try cur.append(a, c);
+            in_word = true;
+        }
+    }
+    if (in_word) try list.append(a, try cur.toOwnedSlice(a));
+    return list.toOwnedSlice(a);
+}
+
 fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []const u8) !void {
     var tio = std.Io.Threaded.init(gpa, .{});
     defer tio.deinit();
@@ -980,26 +1462,450 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
         std.debug.print("[oci] cached image at {s}\n", .{entry});
     }
 
-    // Pack the rootfs + generated /init into one initramfs cpio.
+    // Overlay isolation only applies to the rootfs-over-virtiofs path (the
+    // initramfs path already gives each guest its own in-RAM root).
+    const overlay_root = useVirtiofsRoot() and overlay_isolation;
+    const init_script = try buildOciInit(arena, cfg, opts, overlay_root, hostEpochSecs(io));
+    // Resolve the kernel independent of the CWD (finds the repo/next-to-binary
+    // kernel instead of mis-fetching a stale one when launched from zig-out/bin),
+    // then fetch it there if still missing. cmdBoot won't re-fetch: its auto-fetch
+    // is scoped to the plain default path, which this resolved path isn't.
+    const kernel = try kernel_fetch.resolveKernelPath(arena, io);
+    _ = kernel_fetch.ensureKernel(gpa, io, kernel) catch |err| {
+        std.debug.print("contain: kernel auto-fetch failed: {s}\n  build it locally: ./tools/build_kernel.sh\n", .{@errorName(err)});
+    };
+    const input: []const u8 = if (opts.interactive) "tty" else "-";
+
+    // Compose inter-service forwards ("vip:cport:hport,...") for the guest's NAT,
+    // built from the --link entries this run was given.
+    var svc_aw = std.Io.Writer.Allocating.init(arena);
+    for (opts.links, 0..) |lk, idx| {
+        if (idx != 0) try svc_aw.writer.writeByte(',');
+        try svc_aw.writer.print("{s}:{d}:{d}", .{ lk.vip, lk.cport, lk.hport });
+    }
+    const svc_spec: ?[]const u8 = if (opts.links.len != 0) svc_aw.written() else null;
+
+    // Two ways to give the guest its root filesystem:
+    //
+    //  (a) rootfs-over-virtiofs (DEFAULT on x86): mount `rootfs_dir` as the guest's
+    //      real root over virtio-fs and demand-page it. The whole image never has to
+    //      be resident in guest RAM — a huge memory win over packing it into an
+    //      in-RAM initramfs. The generated init is written into the rootfs as
+    //      `/.contain-init` (the kernel's `init=`). No cpio, no read-back.
+    //
+    //  (b) legacy initramfs pack (arm64, or CONTAIN_ROOTFS=initramfs): pack the
+    //      rootfs + `/init` into one cpio and boot it as the initramfs root. Used
+    //      until the arm64 FUSE guest kernel ships (its release kernel has no
+    //      CONFIG_VIRTIO_FS), and as an escape hatch on x86.
+    if (useVirtiofsRoot()) {
+        // Unique init filename so concurrent guests sharing this cached image rootfs
+        // (e.g. `contain compose up` of two containers off the same image) don't
+        // clobber each other's init file on disk.
+        const guest_init = try std.fmt.allocPrint(arena, "/.contain-init-{x}", .{pidToken()});
+        machine_mod.rootfs_init_path = guest_init;
+        const init_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ rootfs_dir, guest_init });
+        try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
+        std.debug.print("[contain] rootfs-over-virtiofs: booting '{s}' (demand-paged root, no initramfs)\n", .{opts.image});
+        try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, null, rootfs_dir, svc_spec);
+        return;
+    }
+
+    // Legacy: pack the rootfs + generated /init into one initramfs cpio.
     std.debug.print("[contain] packing rootfs into initramfs...\n", .{});
     var cw = cpio.Writer.init(gpa);
     defer cw.deinit();
     var root = try std.Io.Dir.cwd().openDir(io, rootfs_dir, .{ .iterate = true });
     defer root.close(io);
     try rootfs.packDir(io, &cw, gpa, root);
-    const init_script = try buildOciInit(arena, cfg, opts);
     try cw.addFile("init", cpio.MODE_FILE, init_script);
     try cw.finish();
     std.debug.print("[contain] initramfs {d} bytes; booting OCI image '{s}'\n", .{ cw.bytes().len, opts.image });
+    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes(), null, svc_spec);
+}
 
-    // Reuse the full boot path with the host-arch kernel + the rootfs-as-initramfs
-    // (no 9p share). The packed cpio is handed to cmdBoot in memory (initrd_override)
-    // — no temp file, no read-back, no 1 GB read cap; guest RAM is auto-sized to it.
-    // x86 hosts boot the custom PVH kernel (-> KVM/WHP); arm64 the Kata Image
-    // (-> HVF/KVM). The ELF magic of vmlinux-contain selects x86-microvm.
-    const kernel = kernel_fetch.defaultKernelPath();
-    const input: []const u8 = if (opts.interactive) "tty" else "-";
-    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes());
+/// Set from CONTAIN_ROOTFS=initramfs in main() (where the env map is available).
+var force_initramfs_root: bool = false;
+
+/// Per-container overlay isolation (a private tmpfs upper layer over the shared
+/// read-only image root). On by default for the rootfs-over-virtiofs path so
+/// concurrent containers of one image don't clobber each other's writes; set
+/// CONTAIN_OVERLAY=0 to disable (writes then go straight to the shared rootfs).
+var overlay_isolation: bool = true;
+
+/// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
+/// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
+/// (ships a FUSE guest kernel); arm64 falls back until its FUSE kernel is released.
+/// CONTAIN_ROOTFS=initramfs forces the legacy pack.
+fn useVirtiofsRoot() bool {
+    if (force_initramfs_root) return false;
+    return builtin.cpu.arch == .x86_64;
+}
+
+/// Accumulated build state -> the output image config.
+const BuildConfig = struct {
+    env: std.ArrayListUnmanaged([]const u8) = .empty,
+    workdir: []const u8 = "",
+    cmd: []const []const u8 = &.{},
+    entrypoint: []const []const u8 = &.{},
+    user: []const u8 = "",
+    exposed: std.ArrayListUnmanaged([]const u8) = .empty,
+};
+
+/// `contain build [-t NAME[:TAG]] [-f DOCKERFILE] CONTEXT` — build an image from a
+/// Dockerfile using the core instruction set (FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/
+/// ENTRYPOINT/ARG/…); no BuildKit. Each RUN executes inside a contain guest with
+/// the build rootfs mounted rw over virtio-fs so steps compose; COPY/ADD copy from
+/// the build context host-side; metadata accumulates into the output config. The
+/// result is stored in the image cache under NAME so `contain run NAME` runs it.
+fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cache_base: []const u8) !void {
+    if (builtin.cpu.arch != .x86_64) {
+        std.debug.print("contain build: only x86 hosts are supported for now (the arm64 FUSE guest kernel isn't released yet)\n", .{});
+        return;
+    }
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // Parse docker-style args: -t/--tag, -f/--file, positional CONTEXT.
+    var tag: []const u8 = "contain-build:latest";
+    var dockerfile: ?[]const u8 = null;
+    var context: []const u8 = ".";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-t") or std.mem.eql(u8, a, "--tag")) {
+            i += 1;
+            if (i < args.len) tag = args[i];
+        } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--file")) {
+            i += 1;
+            if (i < args.len) dockerfile = args[i];
+        } else if (a.len > 0 and a[0] == '-') {
+            // Unknown flags (e.g. --no-cache, --build-arg) are accepted-and-ignored
+            // so common invocations don't hard-fail. --build-arg takes a value.
+            if (std.mem.eql(u8, a, "--build-arg")) i += 1;
+        } else {
+            context = a;
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const df_path = dockerfile orelse try std.fmt.allocPrint(arena, "{s}/Dockerfile", .{context});
+    const df_src = cwd.readFileAlloc(io, df_path, gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain build: cannot read Dockerfile '{s}': {s}\n", .{ df_path, @errorName(err) });
+        return;
+    };
+    defer gpa.free(df_src);
+
+    var df = build_mod.parse(gpa, df_src) catch |err| {
+        std.debug.print("contain build: Dockerfile parse error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer df.deinit();
+    if (df.instructions.len == 0 or df.instructions[0].op != .from) {
+        std.debug.print("contain build: the first instruction must be FROM\n", .{});
+        return;
+    }
+
+    const arch = registry.Arch.hostDefault();
+    const entry = try registry.cacheEntryPath(arena, cache_base, tag, arch);
+    const rootfs_dir = try std.fmt.allocPrint(arena, "{s}/rootfs", .{entry});
+    const cfg_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{entry});
+    const complete = try std.fmt.allocPrint(arena, "{s}/.complete", .{entry});
+    const blobs_dir = try std.fmt.allocPrint(arena, "{s}/blobs", .{cache_base});
+
+    // Ensure the guest kernel is present (each RUN step subprocess reads it itself).
+    // Resolve CWD-independently so it matches what the __buildstep subprocess reads.
+    const kpath = kernel_fetch.resolveKernelPath(arena, io) catch kernel_fetch.defaultKernelPath();
+    _ = kernel_fetch.ensureKernel(gpa, io, kpath) catch {};
+    // This executable's path — RUN steps re-invoke it as `contain __buildstep`.
+    const exe = try std.process.executablePathAlloc(io, arena);
+
+    var bc = BuildConfig{};
+
+    var step: usize = 0;
+    for (df.instructions) |ins| {
+        switch (ins.op) {
+            .from => {
+                const base = build_mod.fromImage(ins.args);
+                std.debug.print("[build] FROM {s}\n", .{base});
+                cwd.deleteTree(io, entry) catch {};
+                cwd.createDirPath(io, rootfs_dir) catch {};
+                var tio = std.Io.Threaded.init(gpa, .{});
+                defer tio.deinit();
+                const base_cfg = registry.pull(gpa, arena, tio.io(), base, rootfs_dir, arch, .{
+                    .cache_dir = blobs_dir,
+                }) catch |err| {
+                    std.debug.print("contain build: pulling base '{s}' failed: {s}\n", .{ base, @errorName(err) });
+                    return;
+                };
+                // Seed the output config from the base image.
+                for (base_cfg.env) |e| try bc.env.append(arena, try arena.dupe(u8, e));
+                bc.workdir = try arena.dupe(u8, base_cfg.working_dir);
+                bc.cmd = base_cfg.cmd;
+                bc.entrypoint = base_cfg.entrypoint;
+                bc.user = try arena.dupe(u8, base_cfg.user);
+            },
+            .run => {
+                step += 1;
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                const shell_cmd = if (parsed.is_exec) try joinArgv(arena, parsed.argv) else parsed.argv[0];
+                std.debug.print("[build] RUN {s}\n", .{shell_cmd});
+                const init_script = try buildStepInit(arena, bc.env.items, nullIfEmpty(bc.workdir), shell_cmd, hostEpochSecs(io));
+                const init_path = try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir});
+                try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
+                const status_path = try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir});
+                cwd.deleteFile(io, status_path) catch {};
+                // Boot the RUN step in a subprocess (clean process.exit teardown —
+                // an in-process boot could hang joining NAT threads after a
+                // network-heavy step like `apk add`).
+                const term = spawnWait(io, arena, &.{ exe, "__buildstep", rootfs_dir }) catch |err| {
+                    std.debug.print("contain build: RUN step failed to boot: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                if (term != .exited or term.exited != 0) {
+                    std.debug.print("contain build: RUN step subprocess failed\n", .{});
+                    std.process.exit(1);
+                }
+                const st = cwd.readFileAlloc(io, status_path, gpa, .limited(64)) catch {
+                    std.debug.print("contain build: RUN did not report an exit status (guest crashed?)\n", .{});
+                    std.process.exit(1);
+                };
+                defer gpa.free(st);
+                const code = std.fmt.parseInt(u32, std.mem.trim(u8, st, " \t\r\n"), 10) catch 1;
+                if (code != 0) {
+                    std.debug.print("contain build: RUN '{s}' exited with status {d}\n", .{ shell_cmd, code });
+                    std.process.exit(@truncate(code)); // docker-style nonzero exit on RUN failure
+                }
+            },
+            .copy, .add => {
+                const words = try build_mod.splitWords(arena, ins.args);
+                // Drop any --from=/--chown= flags (BuildKit/COPY options we don't model).
+                var srcs: std.ArrayListUnmanaged([]const u8) = .empty;
+                var dest: []const u8 = "";
+                for (words) |w| {
+                    if (w.len > 0 and w[0] == '-') continue;
+                    try srcs.append(arena, w);
+                }
+                if (srcs.items.len < 2) {
+                    std.debug.print("contain build: {s} needs at least a source and a destination\n", .{@tagName(ins.op)});
+                    return;
+                }
+                dest = srcs.items[srcs.items.len - 1];
+                const sources = srcs.items[0 .. srcs.items.len - 1];
+                copyIntoRootfs(io, gpa, arena, context, rootfs_dir, sources, dest) catch |err| {
+                    std.debug.print("contain build: {s} failed: {s}\n", .{ @tagName(ins.op), @errorName(err) });
+                    return;
+                };
+                std.debug.print("[build] {s} {d} path(s) -> {s}\n", .{ @tagName(ins.op), sources.len, dest });
+            },
+            .env => {
+                const pairs = try build_mod.parseEnv(arena, ins.args);
+                for (pairs) |p| try bc.env.append(arena, try arena.dupe(u8, p));
+            },
+            .workdir => {
+                bc.workdir = try arena.dupe(u8, std.mem.trim(u8, ins.args, " \t"));
+                // Create the workdir in the rootfs so a later `cd` succeeds.
+                const wd_abs = try std.fmt.allocPrint(arena, "{s}{s}", .{ rootfs_dir, bc.workdir });
+                cwd.createDirPath(io, wd_abs) catch {};
+            },
+            .cmd => {
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                bc.cmd = if (parsed.is_exec) parsed.argv else try shellArgv(arena, parsed.argv[0]);
+            },
+            .entrypoint => {
+                const parsed = try build_mod.parseExecOrShell(arena, ins.args);
+                bc.entrypoint = if (parsed.is_exec) parsed.argv else try shellArgv(arena, parsed.argv[0]);
+            },
+            .user => bc.user = try arena.dupe(u8, std.mem.trim(u8, ins.args, " \t")),
+            .expose => try bc.exposed.append(arena, try arena.dupe(u8, ins.args)),
+            .arg, .label => {}, // accepted, not acted on (ARG defaults/LABEL metadata)
+            .unsupported => std.debug.print("[build] (skipping unsupported instruction at line {d})\n", .{ins.line}),
+        }
+    }
+
+    // Write the output image config (OCI image-config JSON) + the .complete marker,
+    // and drop the transient build init so it doesn't ship in the image.
+    cwd.deleteFile(io, try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir})) catch {};
+    cwd.deleteFile(io, try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir})) catch {};
+    const cfg_json = try renderImageConfig(arena, arch, bc);
+    try cwd.writeFile(io, .{ .sub_path = cfg_path, .data = cfg_json });
+    // Also drop it inside the rootfs (embedded config) for the library boot path.
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rootfs_dir, registry.embedded_config_name }), .data = cfg_json });
+    try cwd.writeFile(io, .{ .sub_path = complete, .data = "" });
+    std.debug.print("[build] built image '{s}'  ->  run it with: contain run {s}\n", .{ tag, tag });
+}
+
+fn nullIfEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+/// The host's current wall-clock time in Unix seconds. Baked into the guest init
+/// (`date -s @<epoch>`) because the x86 guest has no working RTC (the emulated CMOS
+/// presents a fixed time and the kernel's rtc_cmos probe fails), leaving the guest
+/// clock near the epoch — which makes TLS certificate validation fail (apk/pip/npm
+/// over HTTPS report "certificate not trusted"). Setting a sane clock fixes it.
+fn hostEpochSecs(io: std.Io) i64 {
+    const ns = std.Io.Clock.now(.real, io).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_s));
+}
+
+/// This process's OS process id — a per-process unique token (used to name each
+/// run's guest init file so concurrent guests off one shared image rootfs don't
+/// collide). Each `contain run` is its own process, incl. `compose`'s children.
+fn pidToken() u32 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
+/// Wrap a shell-form command string as `["/bin/sh","-c",cmd]` (Docker's CMD/
+/// ENTRYPOINT shell form).
+fn shellArgv(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, 3);
+    out[0] = "/bin/sh";
+    out[1] = "-c";
+    out[2] = try a.dupe(u8, cmd);
+    return out;
+}
+
+/// Join an exec-form argv into a single shell command string (best-effort; args are
+/// space-joined — adequate for the common RUN ["sh","-c","…"] shape).
+fn joinArgv(a: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    for (argv, 0..) |arg, idx| {
+        if (idx != 0) try buf.append(a, ' ');
+        try buf.appendSlice(a, arg);
+    }
+    return buf.items;
+}
+
+/// The `/.contain-init` a RUN step boots: bring up mounts/console/networking, apply
+/// the accumulated ENV + WORKDIR, run the command, record its exit status to a
+/// host-readable file, and power off.
+fn buildStepInit(arena: std.mem.Allocator, env: []const []const u8, workdir: ?[]const u8, command: []const u8, epoch: i64) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.print(
+        \\#!/bin/sh
+        \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
+        \\mkdir -p /proc /sys /dev 2>/dev/null
+        \\mount -t proc proc /proc 2>/dev/null
+        \\mount -t sysfs sysfs /sys 2>/dev/null
+        \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
+        \\exec </dev/console >/dev/console 2>&1
+        \\date -s @{d} >/dev/null 2>&1 || date -u -s "@{d}" >/dev/null 2>&1
+        \\
+    , .{ epoch, epoch });
+    try w.writeAll(
+        \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null
+        \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+        \\ip link set eth0 up 2>/dev/null
+        \\ip route add default via 10.0.2.2 2>/dev/null || route add default gw 10.0.2.2 2>/dev/null
+        \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
+        \\
+    );
+    for (env) |e| try w.print("export \"{s}\"\n", .{e});
+    if (workdir) |d| try w.print("mkdir -p {s} 2>/dev/null; cd {s} 2>/dev/null\n", .{ d, d });
+    // Run the RUN command through /bin/sh; record its status for the host.
+    try w.writeAll("/bin/sh -c ");
+    try shellQuote(w, command);
+    try w.writeAll("\n__st=$?\n");
+    try w.writeAll("echo $__st > /.contain-build-status 2>/dev/null\nsync\n");
+    try w.writeAll(rootfs.poweroff_seq);
+    return aw.written();
+}
+
+/// Copy build-context `sources` (relative to `context`) into `dest` inside
+/// `rootfs_dir`. If dest ends in '/' or there are multiple sources, dest is a
+/// directory; otherwise a file rename. Recursive for directories.
+fn copyIntoRootfs(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, context: []const u8, rootfs_dir: []const u8, sources: []const []const u8, dest: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const dest_is_dir = dest.len == 0 or dest[dest.len - 1] == '/' or sources.len > 1 or std.mem.eql(u8, dest, ".");
+    var dclean = dest;
+    while (dclean.len > 0 and dclean[0] == '/') dclean = dclean[1..];
+    const dest_abs_base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rootfs_dir, dclean });
+    if (dest_is_dir) cwd.createDirPath(io, dest_abs_base) catch {};
+    for (sources) |src| {
+        const src_abs = try std.fmt.allocPrint(arena, "{s}/{s}", .{ context, src });
+        const base = std.fs.path.basename(src);
+        const dst_abs = if (dest_is_dir)
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ dest_abs_base, base })
+        else
+            dest_abs_base;
+        try copyTree(io, gpa, arena, src_abs, dst_abs);
+    }
+}
+
+/// Recursively copy a host file or directory tree from `src` to `dst`.
+fn copyTree(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const st = cwd.statFile(io, src, .{}) catch |err| {
+        std.debug.print("contain build: cannot stat '{s}': {s}\n", .{ src, @errorName(err) });
+        return err;
+    };
+    if (st.kind == .directory) {
+        cwd.createDirPath(io, dst) catch {};
+        var dir = try cwd.openDir(io, src, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            const child_src = try std.fmt.allocPrint(arena, "{s}/{s}", .{ src, e.name });
+            const child_dst = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dst, e.name });
+            try copyTree(io, gpa, arena, child_src, child_dst);
+        }
+    } else {
+        // Ensure the destination's parent directory exists (e.g. COPY x /a/b/x
+        // where /a/b isn't in the base image yet).
+        if (std.fs.path.dirname(dst)) |parent| cwd.createDirPath(io, parent) catch {};
+        const data = try cwd.readFileAlloc(io, src, gpa, .limited(2 * 1024 * 1024 * 1024));
+        defer gpa.free(data);
+        try cwd.writeFile(io, .{ .sub_path = dst, .data = data });
+    }
+}
+
+/// Serialize the accumulated build config as an OCI image-config JSON (the shape
+/// registry.parseConfig reads back). Includes `architecture`/`os` so the pull-side
+/// arch check is satisfied if this image is ever inspected that way.
+fn renderImageConfig(arena: std.mem.Allocator, arch: registry.Arch, bc: BuildConfig) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"architecture\":\"{s}\",\"os\":\"linux\",\"config\":{{", .{arch.str()});
+    try w.writeAll("\"Env\":");
+    try writeJsonStrArray(w, bc.env.items);
+    try w.writeAll(",\"Cmd\":");
+    try writeJsonStrArray(w, bc.cmd);
+    try w.writeAll(",\"Entrypoint\":");
+    try writeJsonStrArray(w, bc.entrypoint);
+    try w.print(",\"WorkingDir\":", .{});
+    try writeJsonString(w, bc.workdir);
+    try w.writeAll(",\"User\":");
+    try writeJsonString(w, bc.user);
+    try w.writeAll("}}");
+    return aw.written();
+}
+
+fn writeJsonStrArray(w: *std.Io.Writer, items: []const []const u8) !void {
+    try w.writeByte('[');
+    for (items, 0..) |s, idx| {
+        if (idx != 0) try w.writeByte(',');
+        try writeJsonString(w, s);
+    }
+    try w.writeByte(']');
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('"');
 }
 
 /// Derive a default rootfs dir from an image ref: the name after the last '/',

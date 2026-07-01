@@ -7,8 +7,8 @@
 #
 # Produces (stripped + gzip'd, for hosting) under artifacts/release/, and drops
 # the raw kernels in artifacts/ for an immediate local boot:
-#   artifacts/release/Image-arm64.gz            -> artifacts/Image-arm64      (arm64 Image)
-#   artifacts/release/vmlinux-contain-x86_64.gz -> artifacts/vmlinux-contain  (x86 PVH ELF)
+#   artifacts/release/kernel-contain-arm64.gz            -> artifacts/kernel-contain-arm64      (arm64 Image)
+#   artifacts/release/kernel-contain-x86_64.gz -> artifacts/kernel-contain-x86_64  (x86 PVH ELF)
 #   artifacts/release/SHA256SUMS
 #
 # These are the assets src/kernel_fetch.zig downloads from the GitHub release.
@@ -76,6 +76,18 @@ if [ "$ARCH_SEL" = arm64 ]; then
   m --enable  VIRTIO_BLK --enable VIRTIO_NET
   m --enable  HW_RANDOM --enable HW_RANDOM_VIRTIO
   m --enable  NET_9P --enable NET_9P_VIRTIO --enable 9P_FS
+  # virtio-fs (FUSE): the default host-share + rootfs transport (see memory
+  # contain-virtiofs-build-compose). Non-DAX (no shared-memory window).
+  m --enable  FUSE_FS --enable VIRTIO_FS
+  m --disable FUSE_DAX
+  m --enable  OVERLAY_FS
+  # --- container-runtime features real OCI workloads need (full checklist: moby
+  # contrib/check-config.sh; see memory contain-compose-netns-overlay) ---
+  m --enable  USER_NS           # Chromium/bubblewrap sandboxes; rootless/nested sandboxing
+  m --enable  MEMCG             # cgroup memory controller (Node/JVM/Go size heaps from it)
+  m --enable  NETFILTER --enable NF_CONNTRACK --enable NF_NAT
+  m --enable  NF_TABLES --enable NF_TABLES_INET --enable NFT_CT --enable NFT_NAT --enable NFT_MASQ --enable NFT_COMPAT
+  m --disable NETFILTER_XT_TARGET_TCPMSS   # the one xt object whose O= out-of-tree Kbuild rule breaks
   m --enable  SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE
   m --enable  BLK_DEV_INITRD
   # Trim defconfig hard for a headless virtio guest: no ACPI (we boot from a
@@ -83,7 +95,7 @@ if [ "$ARCH_SEL" = arm64 ]; then
   # storage / net / display / input. Keep ext4 + 9p + overlay + tmpfs and the
   # arm64 virt core (GICv2, arch timer, PSCI, PL011, virtio-mmio).
   for o in ACPI DRM SOUND MEDIA_SUPPORT WLAN WIRELESS USB_SUPPORT INFINIBAND \
-           SCSI ATA NVME_CORE MMC MTD MD BT NFC NETFILTER ETHERNET \
+           SCSI ATA NVME_CORE MMC MTD MD BT NFC ETHERNET \
            HID IIO STAGING COMEDI NEW_LEDS HWMON THERMAL WATCHDOG POWER_SUPPLY \
            SND REGULATOR MEDIA_SUPPORT_FILTER CRYPTO_HW KEXEC CRASH_DUMP PROFILING \
            XFS_FS BTRFS_FS F2FS_FS GFS2_FS OCFS2_FS NILFS2_FS JFS_FS REISERFS_FS \
@@ -93,10 +105,11 @@ if [ "$ARCH_SEL" = arm64 ]; then
   m --enable EXT4_FS --enable OVERLAY_FS --enable TMPFS
   m --enable NETDEVICES --enable VIRTIO_NET
   make ARCH=arm64 O=build-arm64 olddefconfig
+  for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS CONFIG_OVERLAY_FS CONFIG_USER_NS CONFIG_MEMCG CONFIG_NF_TABLES; do grep -q "^$s=y" build-arm64/.config || { echo "ERROR: $s not =y (olddefconfig dropped it)"; exit 1; }; done
   make ARCH=arm64 O=build-arm64 -j"$J" Image
-  install -m644 build-arm64/arch/arm64/boot/Image /out/Image-arm64
-  gzip -9 -c build-arm64/arch/arm64/boot/Image > /out/release/Image-arm64.gz
-  ls -l /out/Image-arm64 /out/release/Image-arm64.gz
+  install -m644 build-arm64/arch/arm64/boot/Image /out/kernel-contain-arm64
+  gzip -9 -c build-arm64/arch/arm64/boot/Image > /out/release/kernel-contain-arm64.gz
+  ls -l /out/kernel-contain-arm64 /out/release/kernel-contain-arm64.gz
 
 elif [ "$ARCH_SEL" = x86_64 ]; then
   # Mirror tools/build_x86_kernel.sh: simplest mm init (no deferred page init,
@@ -112,29 +125,54 @@ elif [ "$ARCH_SEL" = x86_64 ]; then
   m --enable  VIRTIO_BLK --enable VIRTIO_NET
   m --enable  HW_RANDOM --enable HW_RANDOM_VIRTIO
   m --enable  NET_9P --enable NET_9P_VIRTIO --enable 9P_FS
+  # virtio-fs (FUSE): default host-share + rootfs-over-virtiofs transport on x86.
+  m --enable  FUSE_FS --enable VIRTIO_FS
+  m --disable FUSE_DAX
+  m --enable  OVERLAY_FS
+  # --- container-runtime features real OCI workloads need (full checklist: moby
+  # contrib/check-config.sh; see memory contain-compose-netns-overlay) ---
+  m --enable  USER_NS           # Chromium/bubblewrap sandboxes; rootless/nested sandboxing
+  m --enable  MEMCG             # cgroup memory controller (Node/JVM/Go size heaps from it)
+  m --enable  NETFILTER --enable NF_CONNTRACK --enable NF_NAT
+  m --enable  NF_TABLES --enable NF_TABLES_INET --enable NFT_CT --enable NFT_NAT --enable NFT_MASQ --enable NFT_COMPAT
+  m --disable NETFILTER_XT_TARGET_TCPMSS   # the one xt object whose O= out-of-tree Kbuild rule breaks
   m --disable DEFERRED_STRUCT_PAGE_INIT --disable NUMA
   m --disable RANDOMIZE_BASE --disable RANDOMIZE_MEMORY
   m --set-val NR_CPUS 1
-  # Trim subsystems a headless virtio/PVH guest never uses. NETFILTER off also
-  # dodges an out-of-tree (O=) Kbuild break on net/netfilter/xt_TCPMSS.o. Keep
-  # ACPI (the x86 boot relies on it, falling back to the MP table) unlike arm64.
-  for o in NETFILTER DRM SOUND SND MEDIA_SUPPORT WLAN WIRELESS INFINIBAND \
+  # Trim subsystems a headless virtio/PVH guest never uses. NETFILTER stays ON
+  # now (nftables above); the old xt_TCPMSS O= Kbuild break is dodged by disabling
+  # just that target above. Keep ACPI (x86 boot falls back to the MP table).
+  for o in DRM SOUND SND MEDIA_SUPPORT WLAN WIRELESS INFINIBAND \
            BT NFC HID IIO STAGING; do m --disable "$o"; done
   m --disable DEBUG_INFO   # keep vmlinux small WITHOUT stripping (strip drops the PVH note)
   make ARCH=x86_64 CROSS_COMPILE=$X O=build-x86 olddefconfig
+  for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS CONFIG_OVERLAY_FS CONFIG_USER_NS CONFIG_MEMCG CONFIG_NF_TABLES; do grep -q "^$s=y" build-x86/.config || { echo "ERROR: $s not =y (olddefconfig dropped it)"; exit 1; }; done
   make ARCH=x86_64 CROSS_COMPILE=$X O=build-x86 -j"$J" vmlinux
   # Ship vmlinux as-is — do NOT strip: `strip` removes the `.note.Xen` PT_NOTE
   # that PVH (PHYS32_ENTRY) boot requires. Assert the note on the shipped file.
-  install -m644 build-x86/vmlinux /out/vmlinux-contain
-  readelf -n /out/vmlinux-contain | grep -qi xen || { echo "ERROR: shipped vmlinux has no PVH note"; exit 1; }
-  gzip -9 -c /out/vmlinux-contain > /out/release/vmlinux-contain-x86_64.gz
-  ls -l /out/vmlinux-contain /out/release/vmlinux-contain-x86_64.gz
+  install -m644 build-x86/vmlinux /out/kernel-contain-x86_64
+  readelf -n /out/kernel-contain-x86_64 | grep -qi xen || { echo "ERROR: shipped vmlinux has no PVH note"; exit 1; }
+  gzip -9 -c /out/kernel-contain-x86_64 > /out/release/kernel-contain-x86_64.gz
+  ls -l /out/kernel-contain-x86_64 /out/release/kernel-contain-x86_64.gz
 fi
 INNER
   # Belt-and-suspenders: a failing in-container build hasn't always propagated a
   # non-zero exit through `docker run`, so verify the asset was actually produced.
-  local want; [ "$arch" = arm64 ] && want="$OUT/release/Image-arm64.gz" || want="$OUT/release/vmlinux-contain-x86_64.gz"
+  local want; [ "$arch" = arm64 ] && want="$OUT/release/kernel-contain-arm64.gz" || want="$OUT/release/kernel-contain-x86_64.gz"
   [ -f "$want" ] || { echo "BUILD FAILED: $want was not produced (see output above)"; exit 1; }
+
+  # Self-verify the built .config against Docker's own kernel-feature checklist
+  # (moby contrib/check-config.sh). Informational + non-fatal: many items it flags
+  # are docker-DAEMON features contain doesn't need (it runs the image's process
+  # directly, not a nested runtime). The workload-critical ones (user ns, memcg,
+  # seccomp, overlay, nftables) are already asserted =y in-container above.
+  local cfg; [ "$arch" = arm64 ] && cfg="$KBUILD/linux-$VER/build-arm64/.config" || cfg="$KBUILD/linux-$VER/build-x86/.config"
+  local cc="$KBUILD/check-config.sh"
+  [ -f "$cc" ] || curl -fsSL "https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh" -o "$cc" 2>/dev/null || true
+  if [ -s "$cc" ] && [ -f "$cfg" ]; then
+    echo "=== moby check-config.sh ($arch) — informational; docker-daemon-only items are expected 'missing' ==="
+    bash "$cc" "$cfg" || true
+  fi
 }
 
 case "$WHICH" in

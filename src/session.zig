@@ -145,7 +145,7 @@ pub const Session = struct {
             };
             if (!accel.supported(kind)) return Error.AccelUnsupported;
             self.kind = kind;
-            const m = try Machine.initX86(gpa, io, ram, self.share_path, true, rng_seed[0..32].*, kind == .whp);
+            const m = try Machine.initX86(gpa, io, ram, self.share_path, null, true, rng_seed[0..32].*, kind == .whp);
             errdefer m.deinit();
             self.m = m;
             try m.bootPvh(kernel, initrd);
@@ -154,7 +154,7 @@ pub const Session = struct {
             const kind = accel.fromEnvOrDefault(cfg.accel_override);
             if (!accel.supported(kind)) return Error.AccelUnsupported;
             self.kind = kind;
-            const m = try Machine.init(gpa, io, ram, self.share_path, true, rng_seed[0..32].*);
+            const m = try Machine.init(gpa, io, ram, self.share_path, null, true, rng_seed[0..32].*);
             errdefer m.deinit();
             self.m = m;
             const have_seed = builtin.os.tag == .macos;
