@@ -24,6 +24,27 @@ executes natively on the host's hypervisor. The device models, `Bus`, GIC/IOAPIC
 and the userspace NAT are entirely from scratch and shared across all three
 backends.
 
+## Install
+
+**Linux / macOS — one command:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ddalcu/contain/main/install.sh | sh
+```
+
+Downloads the latest release binary for your OS/arch and installs it to
+`/usr/local/bin` (override with `PREFIX=$HOME/.local/bin`). **Windows:** grab
+`contain-windows-x86_64.exe` from the
+[Releases](https://github.com/ddalcu/contain/releases) page — it runs as-is. Or
+build from source (below); the only dependency is Zig 0.16.
+
+> **Unsigned binaries:** contain isn't code-signed / notarized yet, so a binary
+> downloaded through a **browser** may be blocked by Gatekeeper (macOS) or
+> SmartScreen (Windows). The `curl | sh` install above avoids this — files fetched
+> in a terminal aren't quarantined. If you already downloaded via a browser:
+> on macOS run `xattr -d com.apple.quarantine ./contain` (or right-click → Open
+> once); on Windows click "More info → Run anyway" on the SmartScreen prompt.
+
 ## Quick start
 
 ```sh
