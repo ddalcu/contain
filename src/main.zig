@@ -206,6 +206,13 @@ const default_init =
 // rides in the initramfs) have headroom for the tmpfs copy + the workload.
 pub const default_ram: usize = 2 * 1024 * 1024 * 1024;
 
+/// Default guest RAM when the rootfs is mounted over virtio-fs (demand-paged) —
+/// the image is NOT resident in RAM, so this is pure workload headroom, not
+/// image+headroom. A smaller window also caps the guest page cache (which grows
+/// to fill free RAM and, being host-resident once touched, would otherwise inflate
+/// host RSS toward the full window). Overridable with -m / CONTAIN_MEM.
+pub const default_ram_virtiofs: usize = 1024 * 1024 * 1024; // 1 GB
+
 // Ceiling on a directly-`boot`ed initramfs file read. Auto-sized guest RAM (see
 // ramForInitrd) lets a multi-GB rootfs ride in the initramfs, so the read cap has
 // to clear that; the OCI `run` path skips the file entirely (boots from memory).
@@ -639,6 +646,8 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
             std.debug.print("contain: invalid memory size '{s}' (use e.g. 4G, 512M, or a byte count)\n", .{ms});
             return;
         }
+    else if (rootfs_share != null)
+        default_ram_virtiofs // demand-paged root: size to the workload, not the image
     else
         ramForInitrd(if (initrd) |ir| ir.len else 0);
 
