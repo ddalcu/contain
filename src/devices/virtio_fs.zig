@@ -689,6 +689,16 @@ pub const VirtioFs = struct {
             const a = self.dyn.allocator();
             const nk = a.dupe(u8, dst) catch dst;
             self.symlinks.put(nk, kv.value) catch {};
+            // Persist the FINAL name to the sidecar. Package managers create a
+            // symlink under a temp name then rename it into place; recordSymlink
+            // appended the temp name, so without this the sidecar (read on the next
+            // boot) would only know the temp path and the final name would look like
+            // a 0-byte placeholder — breaking e.g. libjq.so.1 -> libjq.so.1.x.
+            if (builtin.os.tag == .windows) {
+                const line = std.fmt.allocPrint(self.alloc, "{s}\t{s}\n", .{ dst, kv.value }) catch return;
+                defer self.alloc.free(line);
+                self.appendSidecar(line) catch {};
+            }
         }
         if (self.by_path.fetchRemove(dst)) |kv| self.dropNode(kv.value); // overwritten target
         if (self.by_path.fetchRemove(src)) |kv| {

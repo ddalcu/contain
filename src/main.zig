@@ -345,6 +345,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "compose")) {
         const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
         try cmdCompose(gpa, io, args[2..], cache_base);
+    } else if (std.mem.eql(u8, cmd, "__buildstep")) {
+        // Internal: one `contain build` RUN step (spawned as a subprocess).
+        if (args.len < 3) return;
+        try cmdBuildStep(gpa, io, args[2]);
     } else {
         usage();
     }
@@ -614,28 +618,36 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     std.process.exit(0);
 }
 
-/// Boot a rootfs dir over virtio-fs, run its `/.contain-init`, and RETURN cleanly
-/// (unlike bootX86, which process.exit()s). Used by `contain build` to execute a
-/// sequence of RUN steps in one process — each step mounts the shared build rootfs
-/// rw so its changes persist. x86 only (build targets the host arch; the arm64 FUSE
-/// kernel isn't released yet). Returns error.BackendUnavailable if no x86 backend.
-fn bootBuildStep(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, rootfs_dir: []const u8) !void {
-    const host_default = accel.autoDefault();
-    const want = accel.fromEnvOrDefault(null);
-    const kind: accel.Kind = switch (want) {
-        .kvm, .whp => want,
-        else => host_default,
+/// Internal `contain __buildstep <rootfs_dir>` entry: boot a rootfs dir over
+/// virtio-fs, run its `/.contain-init`, and process.exit(0). `contain build` spawns
+/// this as a SUBPROCESS per RUN step, rather than booting in-process, because a
+/// network-heavy RUN (apk/pip/npm) leaves the NAT's blocking reader threads pending
+/// and joining them in Machine.deinit can hang (the same reason bootX86 exits rather
+/// than returns). A fresh process per step gets the clean process.exit teardown and
+/// the step's writes still persist to the shared build rootfs. x86 only.
+fn cmdBuildStep(gpa: std.mem.Allocator, io: std.Io, rootfs_dir: []const u8) !void {
+    const kind = accel.fromEnvOrDefault(null);
+    const eff: accel.Kind = switch (kind) {
+        .kvm, .whp => kind,
+        else => accel.autoDefault(),
     };
-    if (!accel.supported(kind)) return error.BackendUnavailable;
+    if (!accel.supported(eff)) {
+        std.debug.print("contain __buildstep: no x86 backend available\n", .{});
+        std.process.exit(1);
+    }
+    const vmlinux = std.Io.Dir.cwd().readFileAlloc(io, kernel_fetch.defaultKernelPath(), gpa, .limited(128 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain __buildstep: cannot read kernel: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     var rng_seed: [64]u8 = undefined;
     if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
 
-    var m = try Machine.initX86(gpa, io, default_ram_virtiofs, null, rootfs_dir, true, rng_seed[0..32].*, kind == .whp);
-    defer m.deinit(); // clean teardown (no process.exit) so the next RUN step can boot
+    const m = try Machine.initX86(gpa, io, default_ram_virtiofs, null, rootfs_dir, true, rng_seed[0..32].*, eff == .whp);
     m.input = "";
     try m.bootPvh(vmlinux, null);
-    _ = runMachineTimed(io, kind, m);
+    _ = runMachineTimed(io, eff, m);
+    std.process.exit(0); // clean teardown (skip the potentially-hanging NAT join)
 }
 
 fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8) !void {
@@ -1378,14 +1390,10 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
     const complete = try std.fmt.allocPrint(arena, "{s}/.complete", .{entry});
     const blobs_dir = try std.fmt.allocPrint(arena, "{s}/blobs", .{cache_base});
 
-    // Prepare + read the guest kernel once for all RUN steps.
-    const kernel_path = kernel_fetch.defaultKernelPath();
-    _ = kernel_fetch.ensureKernel(gpa, io, kernel_path) catch {};
-    const vmlinux = cwd.readFileAlloc(io, kernel_path, gpa, .limited(128 * 1024 * 1024)) catch |err| {
-        std.debug.print("contain build: cannot read guest kernel '{s}': {s}\n", .{ kernel_path, @errorName(err) });
-        return;
-    };
-    defer gpa.free(vmlinux);
+    // Ensure the guest kernel is present (each RUN step subprocess reads it itself).
+    _ = kernel_fetch.ensureKernel(gpa, io, kernel_fetch.defaultKernelPath()) catch {};
+    // This executable's path — RUN steps re-invoke it as `contain __buildstep`.
+    const exe = try std.process.executablePathAlloc(io, arena);
 
     var bc = BuildConfig{};
 
@@ -1422,10 +1430,17 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
                 try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
                 const status_path = try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir});
                 cwd.deleteFile(io, status_path) catch {};
-                bootBuildStep(gpa, io, vmlinux, rootfs_dir) catch |err| {
+                // Boot the RUN step in a subprocess (clean process.exit teardown —
+                // an in-process boot could hang joining NAT threads after a
+                // network-heavy step like `apk add`).
+                const term = spawnWait(io, arena, &.{ exe, "__buildstep", rootfs_dir }) catch |err| {
                     std.debug.print("contain build: RUN step failed to boot: {s}\n", .{@errorName(err)});
                     return;
                 };
+                if (term != .exited or term.exited != 0) {
+                    std.debug.print("contain build: RUN step subprocess failed\n", .{});
+                    return;
+                }
                 const st = cwd.readFileAlloc(io, status_path, gpa, .limited(64)) catch {
                     std.debug.print("contain build: RUN did not report an exit status (guest crashed?)\n", .{});
                     return;
