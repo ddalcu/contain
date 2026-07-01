@@ -6,7 +6,7 @@
 # for the 9p share). Requires: gcc, make, flex, bison, bc, libelf-dev, libssl-dev,
 # cpio (all preinstalled on a typical dev box).
 #
-# Output: $OUT/vmlinux-contain-fuse  (raw PVH ELF, do NOT strip)
+# Output: $OUT/kernel-contain-x86_64  (raw PVH ELF, do NOT strip)
 set -euo pipefail
 
 VER="${KVER:-6.6.58}"
@@ -61,7 +61,7 @@ done
 echo "=== FUSE/VIRTIO_FS confirmed =y; compiling ($J jobs) ==="
 MK -j"$J" vmlinux
 
-install -m644 build-x86/vmlinux "$OUT/vmlinux-contain-fuse"
-readelf -n "$OUT/vmlinux-contain-fuse" | grep -qi xen || { echo "ERROR: shipped vmlinux has no PVH note"; exit 1; }
-echo "=== DONE: $OUT/vmlinux-contain-fuse ==="
-ls -l "$OUT/vmlinux-contain-fuse"
+install -m644 build-x86/vmlinux "$OUT/kernel-contain-x86_64"
+readelf -n "$OUT/kernel-contain-x86_64" | grep -qi xen || { echo "ERROR: shipped vmlinux has no PVH note"; exit 1; }
+echo "=== DONE: $OUT/kernel-contain-x86_64 ==="
+ls -l "$OUT/kernel-contain-x86_64"

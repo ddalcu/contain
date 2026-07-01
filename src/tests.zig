@@ -52,6 +52,80 @@ test "run args: docker-style flags, positional image + command, volume/env" {
     try std.testing.expectEqualStrings("echo hi", opts.command[1]);
 }
 
+test "run args: --link is parsed into service links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const args = [_][:0]const u8{
+        "--link", "web:10.0.2.100:80:8080",
+        "--link", "db:10.0.2.101:5432:20001",
+        "alpine",
+    };
+    const o = (try main.parseRunArgs(a, &args, null, null)).?;
+    try std.testing.expectEqual(@as(usize, 2), o.links.len);
+    try std.testing.expectEqualStrings("web", o.links[0].name);
+    try std.testing.expectEqualStrings("10.0.2.100", o.links[0].vip);
+    try std.testing.expectEqual(@as(u16, 80), o.links[0].cport);
+    try std.testing.expectEqual(@as(u16, 8080), o.links[0].hport);
+    try std.testing.expectEqualStrings("db", o.links[1].name);
+}
+
+test "run args: --cmd-hex decodes to a shell-split command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // hex of: sh -c "echo hi && ls"
+    const cmd = "sh -c \"echo hi && ls\"";
+    const hex = try main.hexEncode(a, cmd);
+    const args = [_][:0]const u8{ "--cmd-hex", try a.dupeZ(u8, hex), "busybox" };
+    const o = (try main.parseRunArgs(a, &args, null, null)).?;
+    try std.testing.expectEqualStrings("busybox", o.image);
+    try std.testing.expectEqual(@as(usize, 3), o.command.len);
+    try std.testing.expectEqualStrings("sh", o.command[0]);
+    try std.testing.expectEqualStrings("-c", o.command[1]);
+    try std.testing.expectEqualStrings("echo hi && ls", o.command[2]);
+}
+
+test "shellSplit: quotes group an argument with spaces and operators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try main.shellSplit(a, "sh -c \"echo hi > /f && httpd -f\"");
+    try std.testing.expectEqual(@as(usize, 3), w.len);
+    try std.testing.expectEqualStrings("sh", w[0]);
+    try std.testing.expectEqualStrings("-c", w[1]);
+    try std.testing.expectEqualStrings("echo hi > /f && httpd -f", w[2]);
+    // Plain words still split on whitespace.
+    const w2 = try main.shellSplit(a, "httpd  -f -p 80");
+    try std.testing.expectEqual(@as(usize, 4), w2.len);
+    try std.testing.expectEqualStrings("80", w2[3]);
+}
+
+test "buildOciInit: overlay isolation + inter-service /etc/hosts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = registry.ImageConfig{};
+    const links = [_]main.Link{
+        .{ .name = "web", .vip = "10.0.2.100", .cport = 80, .hport = 8080 },
+        .{ .name = "web", .vip = "10.0.2.100", .cport = 443, .hport = 8443 },
+    };
+    const opts = main.RunOpts{ .image = "alpine", .command = &.{"true"}, .links = &links };
+
+    // Overlay on: the init sets up a private writable layer and pivots into it.
+    const s = try main.buildOciInit(a, cfg, opts, true, 0);
+    try std.testing.expect(std.mem.indexOf(u8, s, "mount -t overlay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "pivot_root") != null);
+    // Inter-service name resolution: one /etc/hosts line per service (deduped).
+    try std.testing.expect(std.mem.indexOf(u8, s, "10.0.2.100 web") != null);
+    try std.testing.expect(std.mem.count(u8, s, "10.0.2.100 web") == 1);
+
+    // Overlay off: no overlay/pivot, but hosts entries still present.
+    const s2 = try main.buildOciInit(a, cfg, opts, false, 0);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "pivot_root") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "10.0.2.100 web") != null);
+}
+
 test "run args: bare image, no command; missing image -> null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -531,6 +605,33 @@ test "nat does not answer ARP for unrelated IP" {
     n.input(f[0..len]);
     var out: [128]u8 = undefined;
     try std.testing.expect(n.poll(&out) == null);
+}
+
+test "nat: service forward maps a virtual service IP:port to a host port" {
+    var n = nat.Nat.init(std.testing.allocator, test_mac);
+    defer n.deinit();
+    try n.addServiceForward(.{ 10, 0, 2, 100 }, 80, 20000);
+    try n.addServiceForward(.{ 10, 0, 2, 101 }, 5432, 20001);
+    try std.testing.expectEqual(@as(?u16, 20000), n.lookupService(.{ 10, 0, 2, 100 }, 80));
+    try std.testing.expectEqual(@as(?u16, 20001), n.lookupService(.{ 10, 0, 2, 101 }, 5432));
+    // Wrong port or unknown IP: no match (falls through to a normal outbound connect).
+    try std.testing.expectEqual(@as(?u16, null), n.lookupService(.{ 10, 0, 2, 100 }, 81));
+    try std.testing.expectEqual(@as(?u16, null), n.lookupService(.{ 10, 0, 2, 102 }, 80));
+}
+
+test "nat answers ARP for a registered service virtual IP" {
+    var n = nat.Nat.init(std.testing.allocator, test_mac);
+    defer n.deinit();
+    const vip = [4]u8{ 10, 0, 2, 100 };
+    try n.addServiceForward(vip, 80, 20000);
+    var f: [64]u8 = undefined;
+    const len = ethArp(&f, 1, nat.guest_ip, vip);
+    n.input(f[0..len]);
+    var out: [128]u8 = undefined;
+    _ = n.poll(&out) orelse return error.NoReply;
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, out[20..22], .big)); // ARP reply
+    try std.testing.expectEqualSlices(u8, &nat.gw_mac, out[22..28]); // sender HW = gateway
+    try std.testing.expectEqualSlices(u8, &vip, out[28..32]); // sender IP = the service vip
 }
 
 test "nat echoes ICMP ping to the gateway" {

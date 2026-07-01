@@ -1,0 +1,25 @@
+# Inter-service networking smoke test for `contain compose`.
+#
+# Two services on the compose virtual network, reaching each other BY NAME:
+#   web    - serves a fixed page over HTTP on :80 (published to the host as :8080)
+#   client - waits for `web` to come up, then fetches http://web:80/ and prints
+#            the body. "web" resolves via the injected /etc/hosts entry; the
+#            guest NAT relays web's virtual IP:80 to the host port web published.
+#
+# Run:  contain compose -f examples/compose-nettest/compose.yaml up
+# Expect the client to print:  hello-from-web-service
+#
+# `web` (httpd -f) runs in the foreground and does not exit, so the project keeps
+# running after the client succeeds — stop it with Ctrl-C.
+services:
+  web:
+    image: busybox
+    ports:
+      - "8080:80"
+    command: sh -c "mkdir -p /www && echo hello-from-web-service > /www/index.html && echo '[web] serving on :80' && httpd -f -p 80 -h /www"
+
+  client:
+    image: busybox
+    depends_on:
+      - web
+    command: sh -c 'echo [client] resolving + calling http://web:80 ...; i=0; while [ $i -lt 20 ]; do R=$(wget -qO- http://web:80/); if [ -n "$R" ]; then echo [client] GOT: $R; echo [client] inter-service call OK; break; fi; i=$((i+1)); echo [client] not ready, retry; sleep 2; done'

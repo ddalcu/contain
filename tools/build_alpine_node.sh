@@ -17,7 +17,7 @@
 # Output: artifacts/alpine-node.cpio  (or .cpio.gz with GZIP=1)
 #
 # Boot it, e.g.:
-#     contain boot artifacts/Image-arm64 artifacts/alpine-node.cpio tty - - 8080
+#     contain boot artifacts/kernel-contain-arm64 artifacts/alpine-node.cpio tty - - 8080
 # then inside the guest run your app on 0.0.0.0:8080; reach it from the host at
 # http://127.0.0.1:8080  (see the `ports` arg / README).
 set -euo pipefail
@@ -105,4 +105,4 @@ else
     ( cd "$ROOT" && $PRIV find . | $PRIV cpio -o -H newc --quiet ) > "$OUT"
 fi
 echo "[*] done: $OUT ($(du -h "$OUT" | cut -f1))"
-echo "    boot: contain boot artifacts/Image-arm64 $OUT tty - - 8080"
+echo "    boot: contain boot artifacts/kernel-contain-arm64 $OUT tty - - 8080"

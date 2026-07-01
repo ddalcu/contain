@@ -15,6 +15,9 @@ no external tools): `contain run` is a drop-in for `docker run` —
 `contain run node:22-alpine node ...` runs node natively. `contain build` builds
 images from a Dockerfile and `contain compose up` runs a multi-service
 `compose.yaml` — same syntax as Docker (x86 only for now; see the virtiofs note).
+Compose services reach each other **by name** (inter-service DNS) and each container
+gets its **own writable overlay layer** — see the compose networking/overlay note
+under Gotchas and memory `contain-compose-netns-overlay`.
 
 Each host runs a native-arch Linux guest (host-ISA == guest-ISA), so acceleration
 always applies. Complete: shell, virtio-blk with host persistence, virtio-9p
@@ -43,7 +46,7 @@ zig build lib                      # embeddable static lib -> zig-out/lib/libcon
 Boot / run (see README for the full matrix):
 
 ```sh
-./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio tty - artifacts/share
+./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio tty - artifacts/share
 ./zig-out/bin/contain run node:22-alpine node -e 'console.log(2+2)'
 ```
 
@@ -219,7 +222,7 @@ contain builds its **own lightweight guest kernels** (Linux 6.6.58) — one per 
 with virtio blk/net/9p/rng + the console **built-in** (no modules, no fscache).
 `tools/build_kernel.sh` builds both inside a Docker container (arm64 natively on
 Apple Silicon, x86 cross-compiled with `x86_64-linux-gnu-gcc`) and emits gzip'd
-release assets `Image-arm64.gz` / `vmlinux-contain-x86_64.gz` (~11–12 MB each).
+release assets `kernel-contain-arm64.gz` / `kernel-contain-x86_64.gz` (~11–12 MB each).
 Build gotchas (hard-won — see git history for the iterations):
 - Source is fetched **on the host** and mounted in, because the container can sit
   behind a TLS-intercepting proxy whose root CA it lacks (the host trusts it) —
@@ -237,8 +240,8 @@ Build gotchas (hard-won — see git history for the iterations):
 `src/kernel_fetch.zig` **auto-fetches** the host-arch kernel the first time
 `run`/`boot` finds it missing — a plain HTTPS GET of the release asset from
 `github.com/ddalcu/contain/releases` + gunzip (`std.http.Client` +
-`std.compress.flate`), written to `artifacts/Image-arm64` (arm64) or
-`artifacts/vmlinux-contain` (x86) via a `.part` temp + rename. Bump `release_tag`
+`std.compress.flate`), written to `artifacts/kernel-contain-arm64` (arm64) or
+`artifacts/kernel-contain-x86_64` (x86) via a `.part` temp + rename. Bump `release_tag`
 in `kernel_fetch.zig` when republishing rebuilt kernels. The fetch is scoped to the
 canonical path (`kernel_fetch.defaultKernelPath()`) so a custom `boot <kernel>` is
 never overwritten.
@@ -286,6 +289,22 @@ built-in kernel.
 - rootfs-over-virtiofs boots via `root=rootfs rootfstype=virtiofs rw rootwait
   init=<per-run-unique>`; the init must `mount devtmpfs /dev` then
   `exec </dev/console >/dev/console 2>&1` (the image `/dev` has no console at exec).
+
+**Compose networking + per-container overlay (see memory `contain-compose-netns-overlay`)**
+- **Inter-service DNS**: `compose.planNet` gives each service a virtual IP
+  `10.0.2.(100+idx)` + a host port per container port; each guest gets `/etc/hosts`
+  `vip name` lines and a NAT `svc_fwds` table (`Machine.addServiceForward`) that
+  relays an outbound connect to `vip:cport` → `127.0.0.1:hport` (where that peer
+  published cport). `handleArp` answers for vips. Threaded as `--link` → `svc_spec`.
+- **Overlay isolation** (`buildOciInit`, rootfs-over-virtiofs only): a tmpfs-upper
+  overlayfs over `lowerdir=/` then `pivot_root`. **Needs `CONFIG_OVERLAY_FS=y`** in
+  the guest kernel (`build_kernel.sh` has it; an older fetched `kernel-contain-x86_64` may
+  not — check `grep overlay /proc/filesystems`). After `pivot_root`, `/dev` is empty,
+  so mount devtmpfs FIRST with **no** `2>/dev/null` (the redirect would fail and skip
+  the mount). Guarded — falls through unisolated. `CONTAIN_OVERLAY=0` disables it.
+- **Windows argv spawn splits space-containing args**: compose passes a service
+  `command:` hex-encoded via `--cmd-hex` (space-free) so it survives the subprocess
+  round-trip; `contain run` decodes + quote-aware `shellSplit`s it.
 
 **Device / boot invariants**
 - virtio probe (arm64, emulated GICv2) needs **GICv2 ICFGR** (edge/level config),
@@ -338,8 +357,8 @@ built-in kernel.
 ## Testing changes
 
 Always run `zig build test` (fast, no artifacts needed). For boot-level changes, do
-a build and boot `artifacts/Image-arm64` with the default init (default accel on this
+a build and boot `artifacts/kernel-contain-arm64` with the default init (default accel on this
 host) — it self-tests virtio-blk, 9p, and networking and powers off:
-`./zig-out/bin/contain boot artifacts/Image-arm64 artifacts/initramfs.cpio - - artifacts/share`.
+`./zig-out/bin/contain boot artifacts/kernel-contain-arm64 artifacts/initramfs.cpio - - artifacts/share`.
 A cross-build (`zig build -Dtarget=x86_64-linux` / `aarch64-linux` /
 `x86_64-windows`) confirms the KVM/WHP gating still compiles.

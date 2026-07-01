@@ -302,6 +302,8 @@ pub fn main(init: std.process.Init) !void {
     // CONTAIN_ROOTFS=initramfs forces the legacy rootfs-in-initramfs pack instead of
     // rootfs-over-virtiofs (default on x86). Read here where the env map is available.
     force_initramfs_root = if (init.environ_map.get("CONTAIN_ROOTFS")) |v| std.mem.eql(u8, v, "initramfs") else false;
+    // CONTAIN_OVERLAY=0 disables per-container overlay isolation (default on).
+    overlay_isolation = if (init.environ_map.get("CONTAIN_OVERLAY")) |v| !std.mem.eql(u8, v, "0") else true;
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "boot")) {
@@ -309,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         }
-        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null, null);
+        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null, null, null);
     } else if (std.mem.eql(u8, cmd, "mkinitramfs")) {
         if (args.len < 4) {
             usage();
@@ -493,6 +495,39 @@ fn setupForwards(m: *Machine, spec: []const u8) void {
     }
 }
 
+/// Parse a comma-separated list of compose inter-service forwards, each
+/// "A.B.C.D:cport:hport", and register them on the machine's NAT. The guest
+/// reaches a peer service at its virtual IP (resolved via /etc/hosts) and the
+/// NAT relays to 127.0.0.1:hport where that peer published its container port.
+fn setupServiceForwards(m: *Machine, spec: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, spec, ',');
+    while (it.next()) |tok| {
+        // Split off the two trailing ":cport:hport" fields; the rest is the IP.
+        const c2 = std.mem.lastIndexOfScalar(u8, tok, ':') orelse continue;
+        const c1 = std.mem.lastIndexOfScalar(u8, tok[0..c2], ':') orelse continue;
+        const vip = parseIpv4(tok[0..c1]) orelse continue;
+        const cport = std.fmt.parseInt(u16, tok[c1 + 1 .. c2], 10) catch continue;
+        const hport = std.fmt.parseInt(u16, tok[c2 + 1 ..], 10) catch continue;
+        m.addServiceForward(vip, cport, hport) catch |err| {
+            std.debug.print("[contain] service-forward {s} failed: {s}\n", .{ tok, @errorName(err) });
+            continue;
+        };
+    }
+}
+
+/// Parse a dotted-quad IPv4 literal ("10.0.2.100") into 4 octets, or null.
+fn parseIpv4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var n: usize = 0;
+    while (it.next()) |part| {
+        if (n >= 4) return null;
+        out[n] = std.fmt.parseInt(u8, part, 10) catch return null;
+        n += 1;
+    }
+    return if (n == 4) out else null;
+}
+
 const X86StdinCtx = struct { uart: *Uart16550, io: std.Io, stop: *std.atomic.Value(bool), m: *Machine };
 
 /// Background thread: feed host stdin into the guest's 16550 (x86 console).
@@ -577,7 +612,7 @@ fn runMachineTimed(io: std.Io, kind: accel.Kind, m: *Machine) f64 {
 }
 
 /// Boot an x86-64 `vmlinux` on the x86-microvm platform via a hardware backend.
-fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, rootfs_share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize) !void {
+fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, rootfs_share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize, svc_spec: ?[]const u8) !void {
     // x86-microvm only runs on a hardware backend: WHP on Windows, KVM elsewhere.
     // An explicit CONTAIN_ACCEL=kvm|whp overrides the host default.
     const host_default: accel.Kind = if (builtin.os.tag == .windows) .whp else .kvm;
@@ -604,6 +639,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
 
     loadDisk(io, gpa, m, disk);
     if (ports_spec) |ps| if (!isNone(ps)) setupForwards(m, ps);
+    if (svc_spec) |ss| if (!isNone(ss)) setupServiceForwards(m, ss);
 
     var stop = std.atomic.Value(bool).init(false);
     var stdin_ctx: X86StdinCtx = .{ .uart = m.uart16550.?, .io = io, .stop = &stop, .m = m };
@@ -635,7 +671,8 @@ fn cmdBuildStep(gpa: std.mem.Allocator, io: std.Io, rootfs_dir: []const u8) !voi
         std.debug.print("contain __buildstep: no x86 backend available\n", .{});
         std.process.exit(1);
     }
-    const vmlinux = std.Io.Dir.cwd().readFileAlloc(io, kernel_fetch.defaultKernelPath(), gpa, .limited(128 * 1024 * 1024)) catch |err| {
+    const kpath = kernel_fetch.resolveKernelPath(gpa, io) catch kernel_fetch.defaultKernelPath();
+    const vmlinux = std.Io.Dir.cwd().readFileAlloc(io, kpath, gpa, .limited(128 * 1024 * 1024)) catch |err| {
         std.debug.print("contain __buildstep: cannot read kernel: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -650,7 +687,7 @@ fn cmdBuildStep(gpa: std.mem.Allocator, io: std.Io, rootfs_dir: []const u8) !voi
     std.process.exit(0); // clean teardown (skip the potentially-hanging NAT join)
 }
 
-fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8) !void {
+fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8, svc_spec: ?[]const u8) !void {
     // Auto-fetch the guest kernel when the canonical default is missing (arm64
     // only — x86 builds it from source). Scoped to the default path so a custom
     // `boot <kernel>` never gets silently overwritten with the Kata kernel.
@@ -720,7 +757,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     // An ELF kernel image means a `vmlinux` -> the x86-microvm platform (PVH boot,
     // in-kernel irqchip, 16550 console). Only the hardware backends can run it.
     if (image.len >= 4 and std.mem.eql(u8, image[0..4], "\x7fELF")) {
-        try bootX86(gpa, io, image, initrd, input, disk, share, rootfs_share, ports_spec, accel_override, interactive, ram_size);
+        try bootX86(gpa, io, image, initrd, input, disk, share, rootfs_share, ports_spec, accel_override, interactive, ram_size, svc_spec);
         return;
     }
 
@@ -774,6 +811,8 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
 
     // Optional host->guest port forwards (e.g. expose a guest web app).
     if (ports_spec) |ps| if (!isNone(ps)) setupForwards(m, ps);
+    // Optional compose inter-service forwards (peer service vip:cport relays).
+    if (svc_spec) |ss| if (!isNone(ss)) setupServiceForwards(m, ss);
 
     // Interactive: attach the host terminal to the guest console.
     var stop = std.atomic.Value(bool).init(false);
@@ -817,16 +856,43 @@ fn shellQuote(w: *std.Io.Writer, arg: []const u8) !void {
     try w.writeAll("' ");
 }
 
-fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, epoch: i64) ![]const u8 {
+pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, overlay_root: bool, epoch: i64) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
-    try w.print(
+    try w.writeAll(
         \\#!/bin/sh
         \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
         \\mkdir -p /proc /sys /dev 2>/dev/null
         \\mount -t proc proc /proc 2>/dev/null
         \\mount -t sysfs sysfs /sys 2>/dev/null
         \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
+        \\
+    );
+    // Per-container writable layer. Concurrent containers of the same image share
+    // one read-only image rootfs on the host; give each its own private tmpfs
+    // upper layer (overlayfs) so their writes never collide, then pivot into it.
+    // Everything below then runs on the isolated root. Guarded end-to-end: if the
+    // kernel lacks overlayfs or the switch fails, we fall through unisolated.
+    if (overlay_root) try w.writeAll(
+        \\# --- per-container overlay isolation ---
+        \\if mkdir -p /.contain-ovl 2>/dev/null && mount -t tmpfs tmpfs /.contain-ovl 2>/dev/null; then
+        \\  mkdir -p /.contain-ovl/up /.contain-ovl/work /.contain-ovl/root
+        \\  if mount -t overlay contain -o lowerdir=/,upperdir=/.contain-ovl/up,workdir=/.contain-ovl/work /.contain-ovl/root 2>/dev/null; then
+        \\    mkdir -p /.contain-ovl/root/proc /.contain-ovl/root/sys /.contain-ovl/root/dev /.contain-ovl/root/.oldroot
+        \\    if cd /.contain-ovl/root && pivot_root . .oldroot; then
+        \\      # New root's /dev is the (empty) image /dev — mount devtmpfs FIRST so
+        \\      # /dev/null exists before anything below redirects to it; without the
+        \\      # nodes, a `2>/dev/null` here would fail and skip its own command.
+        \\      mount -t devtmpfs devtmpfs /dev
+        \\      mount -t proc proc /proc
+        \\      mount -t sysfs sysfs /sys
+        \\      cd /
+        \\    fi
+        \\  fi
+        \\fi
+        \\
+    );
+    try w.print(
         \\# Reattach PID 1's stdio to the console. In rootfs-over-virtiofs mode the
         \\# image's /dev has no console at exec time (unlike the kernel's initramfs),
         \\# so without this every command's output would be lost.
@@ -844,6 +910,24 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
         \\
     );
+    // Inter-service name resolution (compose): map each peer service name to its
+    // virtual IP in /etc/hosts, one line per unique service. The guest's NAT
+    // answers ARP for these IPs and relays connections to the peer's host port.
+    {
+        var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (opts.links) |lk| {
+            var dup = false;
+            for (seen.items) |nm| {
+                if (std.mem.eql(u8, nm, lk.name)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try seen.append(arena, lk.name);
+            try w.print("echo \"{s} {s}\" >> /etc/hosts\n", .{ lk.vip, lk.name });
+        }
+    }
     // -v host:container -> mount the shared host directory at the container path.
     if (opts.volume_host != null)
         try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest, opts.volume_guest });
@@ -876,6 +960,17 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
     return aw.written();
 }
 
+/// A compose inter-service link handed to `contain run` via `--link`: the peer
+/// service `name` resolves (via the guest's /etc/hosts) to virtual IP `vip`, and
+/// the guest's NAT relays `vip:cport` to 127.0.0.1:hport where the peer published
+/// its container port. One entry per (peer service, container port).
+pub const Link = struct {
+    name: []const u8,
+    vip: []const u8, // dotted-quad, e.g. "10.0.2.100"
+    cport: u16, // the peer's container port
+    hport: u16, // the host loopback port the peer published cport on
+};
+
 /// The parsed surface of `contain run` — mirrors `docker run`.
 pub const RunOpts = struct {
     image: []const u8,
@@ -890,6 +985,7 @@ pub const RunOpts = struct {
     accel_override: ?[]const u8 = null,
     mem: ?[]const u8 = null, // -m/--memory (docker-style size, e.g. "4G"); else CONTAIN_MEM
     pull_policy: PullPolicy = .missing, // --pull [always|missing|never]
+    links: []const Link = &.{}, // --link name:vip:cport:hport (compose inter-service)
 };
 
 /// When to (re)pull an image vs. reuse the on-disk cache. `.missing` (the default)
@@ -936,6 +1032,8 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
     var opts: RunOpts = .{ .image = "", .accel_override = accel_override, .mem = mem_env };
     var ports: std.ArrayListUnmanaged([]const u8) = .empty;
     var env: std.ArrayListUnmanaged([]const u8) = .empty;
+    var links: std.ArrayListUnmanaged(Link) = .empty;
+    var cmd_hex_words: ?[]const []const u8 = null;
     var nvol: u32 = 0;
 
     const next = struct {
@@ -973,6 +1071,19 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
             opts.workdir = next(args, &i);
         } else if (eq(u8, a, "--entrypoint")) {
             opts.entrypoint = next(args, &i);
+        } else if (eq(u8, a, "--link")) {
+            // Compose inter-service link: name:vip:cport:hport. Malformed entries
+            // are skipped (best effort — this flag is emitted internally).
+            if (next(args, &i)) |v| if (parseLink(v)) |lk| try links.append(arena, lk);
+        } else if (eq(u8, a, "--cmd-hex")) {
+            // Internal: compose passes a service `command:` as a hex-encoded string
+            // so it survives the Windows argv round-trip intact (space-containing
+            // args aren't reliably re-quoted across a subprocess spawn). Decoded
+            // and shell-split here; used as the command if none is given positionally.
+            if (next(args, &i)) |v| {
+                const raw = (hexDecode(arena, v) catch null) orelse continue;
+                cmd_hex_words = try shellSplit(arena, raw);
+            }
         } else if (eq(u8, a, "--name") or eq(u8, a, "-u") or eq(u8, a, "--user")) {
             _ = next(args, &i); // accepted for docker-compat; ignored (guest runs as root)
         } else if (eq(u8, a, "--rm")) {
@@ -1000,15 +1111,60 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
     }
 
     if (opts.image.len == 0) return null;
+    // A --cmd-hex command applies only when no positional command was given.
+    if (cmd_hex_words) |cw| if (opts.command.len == 0) {
+        opts.command = cw;
+    };
     opts.env = try env.toOwnedSlice(arena);
     opts.ports = if (ports.items.len == 0) null else try std.mem.join(arena, ",", ports.items);
+    opts.links = try links.toOwnedSlice(arena);
     return opts;
+}
+
+/// Decode a lowercase-hex string into its bytes (null on odd length / bad digit).
+fn hexDecode(a: std.mem.Allocator, s: []const u8) !?[]u8 {
+    if (s.len % 2 != 0) return null;
+    const out = try a.alloc(u8, s.len / 2);
+    var i: usize = 0;
+    while (i < out.len) : (i += 1) {
+        const hi = std.fmt.charToDigit(s[i * 2], 16) catch return null;
+        const lo = std.fmt.charToDigit(s[i * 2 + 1], 16) catch return null;
+        out[i] = @as(u8, hi) * 16 + lo;
+    }
+    return out;
+}
+
+/// Encode bytes as a lowercase-hex string (inverse of hexDecode).
+pub fn hexEncode(a: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const digits = "0123456789abcdef";
+    const out = try a.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0xf];
+    }
+    return out;
+}
+
+/// Parse a `--link name:vip:cport:hport` value (e.g. "web:10.0.2.100:80:8080").
+/// Returns null on any malformed field. `vip` is kept as the original substring.
+fn parseLink(s: []const u8) ?Link {
+    const c1 = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const name = s[0..c1];
+    // The last two colons separate cport and hport; the middle is the dotted vip.
+    const c3 = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const c2 = std.mem.lastIndexOfScalar(u8, s[0..c3], ':') orelse return null;
+    if (c2 <= c1) return null;
+    const vip = s[c1 + 1 .. c2];
+    const cport = std.fmt.parseInt(u16, s[c2 + 1 .. c3], 10) catch return null;
+    const hport = std.fmt.parseInt(u16, s[c3 + 1 ..], 10) catch return null;
+    if (name.len == 0 or vip.len == 0) return null;
+    return .{ .name = name, .vip = vip, .cport = cport, .hport = hport };
 }
 
 /// `contain run [opts] <image> [cmd...]` — pull a Docker Hub image and run it in
 /// the guest. The unpacked rootfs is packed straight into the initramfs (rootfs
 /// as root), so the image's own shell/loader/binaries run directly. The host-arch
-/// kernel is chosen automatically (x86 -> vmlinux-contain, arm64 -> Image-arm64).
+/// kernel is chosen automatically (x86 -> kernel-contain-x86_64, arm64 -> kernel-contain-arm64).
 ///
 /// The image is cached under `cache_base` keyed by ref+arch: an unpacked `rootfs/`,
 /// its `config.json`, and a `.complete` marker written only after a full pull. A
@@ -1019,9 +1175,9 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
 /// compose-style multi-service runner. SUBCOMMANDs: up (run services), build (build
 /// services that declare `build:`), config (print the parsed model), down (stop —
 /// see note). Each service becomes a `contain run` (or `contain build`) subprocess,
-/// reusing the whole pipeline. NOTE: inter-service networking (reaching another
-/// service by name) is NOT modeled — each service has its own userspace NAT and
-/// host port-forwards; use published ports for host access.
+/// reusing the whole pipeline. Inter-service networking is modeled: each service
+/// gets a virtual IP peers resolve its name to (via /etc/hosts) and its NAT relays
+/// vip:cport to the peer's published host loopback port (see compose_mod.planNet).
 fn cmdCompose(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cache_base: []const u8) !void {
     _ = cache_base;
     var file: ?[]const u8 = null;
@@ -1110,6 +1266,14 @@ fn cmdCompose(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, ca
         return;
     }
 
+    // Plan the virtual network: assign each service a virtual IP and a host port
+    // per exposed container port. This is what lets services reach each other by
+    // name (see compose_mod.planNet).
+    const plan = try compose_mod.planNet(arena, comp.services);
+    // Pre-format each service's virtual IP as a dotted-quad string (for -p/--link).
+    const vips = try arena.alloc([]const u8, comp.services.len);
+    for (plan, 0..) |ni, k| vips[k] = try std.fmt.allocPrint(arena, "{d}.{d}.{d}.{d}", .{ ni.vip[0], ni.vip[1], ni.vip[2], ni.vip[3] });
+
     // Up phase: spawn each service's `contain run`, then wait on them all. Output is
     // inherited (interleaved). Ctrl-C on the compose process tears down the group.
     var children: std.ArrayListUnmanaged(std.process.Child) = .empty;
@@ -1125,11 +1289,23 @@ fn cmdCompose(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, ca
             });
         var rargv: std.ArrayListUnmanaged([]const u8) = .empty;
         try rargv.appendSlice(arena, &.{ exe, "run", "--name", s.name });
-        for (s.ports.items) |p| try rargv.appendSlice(arena, &.{ "-p", p });
+        // Publish this service's ports (both `ports:` and `expose:`) on the host
+        // loopback so peers can relay to them; the planned host port is authoritative.
+        for (plan[idx].ports) |pm|
+            try rargv.appendSlice(arena, &.{ "-p", try std.fmt.allocPrint(arena, "{d}:{d}", .{ pm.hport, pm.cport }) });
+        // Teach this service to resolve every service (including itself) by name:
+        // one --link per (peer service, container port).
+        for (comp.services, 0..) |*peer, j| {
+            for (plan[j].ports) |pm|
+                try rargv.appendSlice(arena, &.{ "--link", try std.fmt.allocPrint(arena, "{s}:{s}:{d}:{d}", .{ peer.name, vips[j], pm.cport, pm.hport }) });
+        }
         for (s.volumes.items) |v| try rargv.appendSlice(arena, &.{ "-v", v });
         for (s.env.items) |e| try rargv.appendSlice(arena, &.{ "-e", e });
+        // Pass the service command hex-encoded so it survives the subprocess
+        // argv round-trip (spaces/quotes aren't reliably re-quoted on Windows).
+        // `contain run` decodes + shell-splits it.
+        if (s.command) |c| try rargv.appendSlice(arena, &.{ "--cmd-hex", try hexEncode(arena, c) });
         try rargv.append(arena, image);
-        if (s.command) |c| for (try shellSplit(arena, c)) |w| try rargv.append(arena, w);
 
         std.debug.print("[compose] starting service '{s}' ({s})\n", .{ s.name, image });
         const child = std.process.spawn(io, .{ .argv = rargv.items }) catch |err| {
@@ -1207,17 +1383,39 @@ fn printService(s: *const compose_mod.Service) void {
     if (s.build) |b| std.debug.print("  build: {s}\n", .{b});
     if (s.command) |c| std.debug.print("  command: {s}\n", .{c});
     for (s.ports.items) |p| std.debug.print("  port: {s}\n", .{p});
+    for (s.expose.items) |e| std.debug.print("  expose: {s}\n", .{e});
     for (s.volumes.items) |v| std.debug.print("  volume: {s}\n", .{v});
     for (s.env.items) |e| std.debug.print("  env: {s}\n", .{e});
     for (s.depends_on.items) |d| std.debug.print("  depends_on: {s}\n", .{d});
 }
 
-/// Split a command string into whitespace-separated words (no quote handling; the
-/// guest re-parses anyway via the run pipeline's shell quoting).
-fn shellSplit(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+/// Split a command string into words, honoring single/double quotes so a compose
+/// `command: sh -c "a && b"` keeps `a && b` as one argument (the quotes group and
+/// are removed). Each resulting word is later single-quoted verbatim into the
+/// guest init, so no further escaping is needed here. No backslash escaping.
+pub fn shellSplit(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    var it = std.mem.tokenizeAny(u8, cmd, " \t");
-    while (it.next()) |w| try list.append(a, try a.dupe(u8, w));
+    var cur: std.ArrayListUnmanaged(u8) = .empty;
+    var in_word = false;
+    var quote: u8 = 0; // 0 = none, else the opening quote char
+    for (cmd) |c| {
+        if (quote != 0) {
+            if (c == quote) quote = 0 else try cur.append(a, c);
+            in_word = true;
+        } else if (c == '\'' or c == '"') {
+            quote = c;
+            in_word = true;
+        } else if (c == ' ' or c == '\t') {
+            if (in_word) {
+                try list.append(a, try cur.toOwnedSlice(a));
+                in_word = false;
+            }
+        } else {
+            try cur.append(a, c);
+            in_word = true;
+        }
+    }
+    if (in_word) try list.append(a, try cur.toOwnedSlice(a));
     return list.toOwnedSlice(a);
 }
 
@@ -1264,9 +1462,28 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
         std.debug.print("[oci] cached image at {s}\n", .{entry});
     }
 
-    const init_script = try buildOciInit(arena, cfg, opts, hostEpochSecs(io));
-    const kernel = kernel_fetch.defaultKernelPath();
+    // Overlay isolation only applies to the rootfs-over-virtiofs path (the
+    // initramfs path already gives each guest its own in-RAM root).
+    const overlay_root = useVirtiofsRoot() and overlay_isolation;
+    const init_script = try buildOciInit(arena, cfg, opts, overlay_root, hostEpochSecs(io));
+    // Resolve the kernel independent of the CWD (finds the repo/next-to-binary
+    // kernel instead of mis-fetching a stale one when launched from zig-out/bin),
+    // then fetch it there if still missing. cmdBoot won't re-fetch: its auto-fetch
+    // is scoped to the plain default path, which this resolved path isn't.
+    const kernel = try kernel_fetch.resolveKernelPath(arena, io);
+    _ = kernel_fetch.ensureKernel(gpa, io, kernel) catch |err| {
+        std.debug.print("contain: kernel auto-fetch failed: {s}\n  build it locally: ./tools/build_kernel.sh\n", .{@errorName(err)});
+    };
     const input: []const u8 = if (opts.interactive) "tty" else "-";
+
+    // Compose inter-service forwards ("vip:cport:hport,...") for the guest's NAT,
+    // built from the --link entries this run was given.
+    var svc_aw = std.Io.Writer.Allocating.init(arena);
+    for (opts.links, 0..) |lk, idx| {
+        if (idx != 0) try svc_aw.writer.writeByte(',');
+        try svc_aw.writer.print("{s}:{d}:{d}", .{ lk.vip, lk.cport, lk.hport });
+    }
+    const svc_spec: ?[]const u8 = if (opts.links.len != 0) svc_aw.written() else null;
 
     // Two ways to give the guest its root filesystem:
     //
@@ -1289,7 +1506,7 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
         const init_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ rootfs_dir, guest_init });
         try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
         std.debug.print("[contain] rootfs-over-virtiofs: booting '{s}' (demand-paged root, no initramfs)\n", .{opts.image});
-        try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, null, rootfs_dir);
+        try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, null, rootfs_dir, svc_spec);
         return;
     }
 
@@ -1303,11 +1520,17 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
     try cw.addFile("init", cpio.MODE_FILE, init_script);
     try cw.finish();
     std.debug.print("[contain] initramfs {d} bytes; booting OCI image '{s}'\n", .{ cw.bytes().len, opts.image });
-    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes(), null);
+    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes(), null, svc_spec);
 }
 
 /// Set from CONTAIN_ROOTFS=initramfs in main() (where the env map is available).
 var force_initramfs_root: bool = false;
+
+/// Per-container overlay isolation (a private tmpfs upper layer over the shared
+/// read-only image root). On by default for the rootfs-over-virtiofs path so
+/// concurrent containers of one image don't clobber each other's writes; set
+/// CONTAIN_OVERLAY=0 to disable (writes then go straight to the shared rootfs).
+var overlay_isolation: bool = true;
 
 /// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
 /// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
@@ -1391,7 +1614,9 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
     const blobs_dir = try std.fmt.allocPrint(arena, "{s}/blobs", .{cache_base});
 
     // Ensure the guest kernel is present (each RUN step subprocess reads it itself).
-    _ = kernel_fetch.ensureKernel(gpa, io, kernel_fetch.defaultKernelPath()) catch {};
+    // Resolve CWD-independently so it matches what the __buildstep subprocess reads.
+    const kpath = kernel_fetch.resolveKernelPath(arena, io) catch kernel_fetch.defaultKernelPath();
+    _ = kernel_fetch.ensureKernel(gpa, io, kpath) catch {};
     // This executable's path — RUN steps re-invoke it as `contain __buildstep`.
     const exe = try std.process.executablePathAlloc(io, arena);
 

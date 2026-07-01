@@ -6,8 +6,10 @@
 //!
 //! `main.zig`'s cmdCompose drives the result: each service maps to a `contain run`
 //! (or a `contain build` when it has a `build:` context), reusing the whole
-//! run/build pipeline. Inter-service networking (service-name DNS) is NOT modeled —
-//! each service gets its own userspace NAT + host port forwards.
+//! run/build pipeline. Inter-service networking IS modeled (see `planNet`): each
+//! service gets a virtual IP other services resolve its name to (via /etc/hosts),
+//! and each guest's NAT relays a peer's vip:port to the host loopback port that
+//! peer published — so `curl http://web:80` from one service reaches another.
 
 const std = @import("std");
 
@@ -18,6 +20,7 @@ pub const Service = struct {
     command: ?[]const u8 = null, // shell-form command line
     env: std.ArrayListUnmanaged([]const u8) = .empty, // KEY=VALUE
     ports: std.ArrayListUnmanaged([]const u8) = .empty, // "host:container"
+    expose: std.ArrayListUnmanaged([]const u8) = .empty, // "container" (inter-service only)
     volumes: std.ArrayListUnmanaged([]const u8) = .empty, // "host:container"
     depends_on: std.ArrayListUnmanaged([]const u8) = .empty,
 };
@@ -37,7 +40,7 @@ pub const Compose = struct {
     }
 };
 
-const Key = enum { none, environment, ports, volumes, depends_on };
+const Key = enum { none, environment, ports, expose, volumes, depends_on };
 
 /// Parse a compose.yaml document into its services.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Compose {
@@ -118,6 +121,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Compose {
             if (val.len != 0) try cur.?.env.append(a, try a.dupe(u8, unquote(val)));
         } else if (std.mem.eql(u8, key, "ports")) {
             cur_key = .ports;
+        } else if (std.mem.eql(u8, key, "expose")) {
+            cur_key = .expose;
         } else if (std.mem.eql(u8, key, "volumes")) {
             cur_key = .volumes;
         } else if (std.mem.eql(u8, key, "depends_on")) {
@@ -133,6 +138,7 @@ fn appendItem(a: std.mem.Allocator, s: *Service, key: Key, item: []const u8) !vo
     switch (key) {
         .environment => try s.env.append(a, try a.dupe(u8, item)),
         .ports => try s.ports.append(a, try a.dupe(u8, item)),
+        .expose => try s.expose.append(a, try a.dupe(u8, item)),
         .volumes => try s.volumes.append(a, try a.dupe(u8, item)),
         .depends_on => try s.depends_on.append(a, try a.dupe(u8, item)),
         .none => {},
@@ -196,6 +202,85 @@ fn unquote(s: []const u8) []const u8 {
     return s;
 }
 
+// ---- inter-service networking plan ------------------------------------------
+
+pub const PortMap = struct {
+    cport: u16, // the service's container port
+    hport: u16, // the host loopback port it's published on (peers relay here)
+};
+
+/// The network identity of one service on the compose virtual network: a virtual
+/// IP peers resolve its name to, and the host port each of its container ports is
+/// published on. See `planNet`.
+pub const NetInfo = struct {
+    vip: [4]u8,
+    ports: []PortMap,
+};
+
+fn stripProto(s: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, s, '/')) |i| s[0..i] else s;
+}
+
+/// Parse a `ports:` entry ("8080:80", "80", "127.0.0.1:8080:80", "80/tcp") into
+/// its container port and an optional explicit host port (the field just left of
+/// the container port). Returns null if the container port isn't a number.
+fn parsePortSpec(spec: []const u8) ?struct { cport: u16, hport: ?u16 } {
+    var fields: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, spec, ':');
+    while (it.next()) |f| : (n += 1) {
+        if (n < fields.len) fields[n] = f;
+    }
+    if (n == 0 or n > fields.len) return null;
+    const cport = std.fmt.parseInt(u16, stripProto(fields[n - 1]), 10) catch return null;
+    const hport: ?u16 = if (n >= 2) (std.fmt.parseInt(u16, stripProto(fields[n - 2]), 10) catch null) else null;
+    return .{ .cport = cport, .hport = hport };
+}
+
+/// Assign each service a place on the compose virtual network: a distinct virtual
+/// IP (10.0.2.100+) and, for every container port it exposes (via `ports:` or
+/// `expose:`), a host loopback port. An explicit `H:C` mapping keeps host port H;
+/// everything else is auto-allocated from 20000 up, avoiding any explicit host
+/// port. Deterministic given the service list. Caller frees via the arena it
+/// passes. This is what makes services reachable from each other by name: each
+/// guest gets /etc/hosts entries (name -> vip) and NAT relays vip:cport -> the
+/// peer's 127.0.0.1:hport.
+pub fn planNet(a: std.mem.Allocator, services: []Service) ![]NetInfo {
+    const infos = try a.alloc(NetInfo, services.len);
+    // Reserve every explicit host port first so auto-allocation never collides.
+    var used = std.AutoHashMap(u16, void).init(a);
+    defer used.deinit();
+    for (services) |*s| for (s.ports.items) |p| {
+        if (parsePortSpec(p)) |pp| if (pp.hport) |h| try used.put(h, {});
+    };
+    var auto: u16 = 20000;
+    const nextAuto = struct {
+        fn f(u: *std.AutoHashMap(u16, void), cur: *u16) !u16 {
+            while (u.contains(cur.*)) cur.* += 1;
+            const v = cur.*;
+            try u.put(v, {});
+            cur.* += 1;
+            return v;
+        }
+    }.f;
+    for (services, 0..) |*s, idx| {
+        // Distinct last octet per service (wraps after 150; far beyond real use).
+        infos[idx].vip = .{ 10, 0, 2, @intCast(100 + (idx % 150)) };
+        var list: std.ArrayListUnmanaged(PortMap) = .empty;
+        for (s.ports.items) |p| {
+            const pp = parsePortSpec(p) orelse continue;
+            const h = pp.hport orelse try nextAuto(&used, &auto);
+            try list.append(a, .{ .cport = pp.cport, .hport = h });
+        }
+        for (s.expose.items) |e| {
+            const cport = std.fmt.parseInt(u16, stripProto(std.mem.trim(u8, e, " \t")), 10) catch continue;
+            try list.append(a, .{ .cport = cport, .hport = try nextAuto(&used, &auto) });
+        }
+        infos[idx].ports = try list.toOwnedSlice(a);
+    }
+    return infos;
+}
+
 // ---- tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -236,6 +321,55 @@ test "compose: parse services with image, ports, env list, volumes, depends_on" 
     const db = c.service("db").?;
     try testing.expectEqualStrings("postgres:16", db.image.?);
     try testing.expectEqualStrings("POSTGRES_PASSWORD=secret", db.env.items[0]);
+}
+
+test "compose: planNet assigns per-service vips and host ports" {
+    const src =
+        \\services:
+        \\  web:
+        \\    image: nginx
+        \\    ports:
+        \\      - "8080:80"
+        \\  db:
+        \\    image: postgres
+        \\    expose:
+        \\      - "5432"
+    ;
+    var c = try parse(testing.allocator, src);
+    defer c.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const plan = try planNet(arena.allocator(), c.services);
+    try testing.expectEqual(@as(usize, 2), plan.len);
+    // Each service gets a distinct virtual IP in the guest subnet, starting at .100.
+    try testing.expectEqual([4]u8{ 10, 0, 2, 100 }, plan[0].vip);
+    try testing.expectEqual([4]u8{ 10, 0, 2, 101 }, plan[1].vip);
+    // web: the published mapping's host port is honored.
+    try testing.expectEqual(@as(usize, 1), plan[0].ports.len);
+    try testing.expectEqual(@as(u16, 80), plan[0].ports[0].cport);
+    try testing.expectEqual(@as(u16, 8080), plan[0].ports[0].hport);
+    // db: an `expose`d (container-only) port gets an auto-allocated host port that
+    // avoids the explicit one (8080).
+    try testing.expectEqual(@as(usize, 1), plan[1].ports.len);
+    try testing.expectEqual(@as(u16, 5432), plan[1].ports[0].cport);
+    try testing.expect(plan[1].ports[0].hport != 8080);
+    try testing.expect(plan[1].ports[0].hport >= 20000);
+}
+
+test "compose: parse exposes container-only ports" {
+    const src =
+        \\services:
+        \\  db:
+        \\    image: postgres
+        \\    expose:
+        \\      - "5432"
+        \\      - "9000"
+    ;
+    var c = try parse(testing.allocator, src);
+    defer c.deinit();
+    const db = c.service("db").?;
+    try testing.expectEqual(@as(usize, 2), db.expose.items.len);
+    try testing.expectEqualStrings("5432", db.expose.items[0]);
 }
 
 test "compose: build context and command flow array" {

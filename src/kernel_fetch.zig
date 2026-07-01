@@ -18,7 +18,7 @@ const flate = std.compress.flate;
 // releases). Assets are public, so the download needs no auth. Bump this only
 // when you actually rebuild + republish the kernels (tools/build_kernel.sh).
 const release_base = "https://github.com/ddalcu/contain/releases/download";
-const release_tag = "kernels-v1";
+const release_tag = "kernels-v2";
 
 const Asset = struct { url_name: []const u8, local_path: []const u8 };
 
@@ -26,8 +26,8 @@ const Asset = struct { url_name: []const u8, local_path: []const u8 };
 /// null if this arch has no prebuilt kernel.
 fn hostAsset() ?Asset {
     return switch (builtin.cpu.arch) {
-        .aarch64 => .{ .url_name = "Image-arm64.gz", .local_path = "artifacts/Image-arm64" },
-        .x86_64 => .{ .url_name = "vmlinux-contain-x86_64.gz", .local_path = "artifacts/vmlinux-contain" },
+        .aarch64 => .{ .url_name = "kernel-contain-arm64.gz", .local_path = "artifacts/kernel-contain-arm64" },
+        .x86_64 => .{ .url_name = "kernel-contain-x86_64.gz", .local_path = "artifacts/kernel-contain-x86_64" },
         else => null,
     };
 }
@@ -38,7 +38,37 @@ pub const Error = error{ UnsupportedHostArch, HttpStatus };
 /// `cmdBoot` only auto-fetches when the requested kernel equals it (never a
 /// user's custom `boot <kernel>` path).
 pub fn defaultKernelPath() []const u8 {
-    return if (hostAsset()) |a| a.local_path else "artifacts/Image-arm64";
+    return if (hostAsset()) |a| a.local_path else "artifacts/kernel-contain-arm64";
+}
+
+/// Resolve the guest-kernel path **independent of the current directory**, so the
+/// binary finds (or fetches to) a stable kernel no matter where it's launched from.
+/// Search order (first that exists wins):
+///   1. `artifacts/<kernel>` relative to the CWD — a dev running from the repo root.
+///   2. `<exe_dir>/artifacts/<kernel>` — a kernel installed next to the binary.
+///   3. `<exe_dir>/../artifacts` and `../../artifacts` — a repo checkout run as
+///      `<repo>/zig-out/bin/contain` (this is the case that used to mis-fetch a
+///      stale kernel into `zig-out/bin/artifacts` because the path was CWD-relative).
+/// If none exist, returns `<exe_dir>/artifacts/<kernel>` as the CWD-independent
+/// target for `ensureKernel` to fetch into. The returned slice is caller-owned.
+pub fn resolveKernelPath(alloc: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const rel = defaultKernelPath(); // e.g. "artifacts/kernel-contain-x86_64"
+    if (fileExists(io, rel)) return alloc.dupe(u8, rel);
+    const exe = std.process.executablePathAlloc(io, alloc) catch return alloc.dupe(u8, rel);
+    defer alloc.free(exe);
+    const exe_dir = std.fs.path.dirname(exe) orelse return alloc.dupe(u8, rel);
+    // Preferred install/fetch location: next to the binary.
+    const primary = try std.fs.path.join(alloc, &.{ exe_dir, rel });
+    if (fileExists(io, primary)) return primary;
+    for ([_][]const u8{ "..", "../.." }) |up| {
+        const cand = try std.fs.path.join(alloc, &.{ exe_dir, up, rel });
+        if (fileExists(io, cand)) {
+            alloc.free(primary);
+            return cand;
+        }
+        alloc.free(cand);
+    }
+    return primary; // nothing exists yet — fetch here (CWD-independent)
 }
 
 /// Ensure the guest kernel exists at `path`. No-op returning false if present;
@@ -126,13 +156,13 @@ test "hostAsset: arm64/x86 map to the right asset + local path" {
     switch (builtin.cpu.arch) {
         .aarch64 => {
             const a = hostAsset().?;
-            try testing.expectEqualStrings("Image-arm64.gz", a.url_name);
-            try testing.expectEqualStrings("artifacts/Image-arm64", a.local_path);
+            try testing.expectEqualStrings("kernel-contain-arm64.gz", a.url_name);
+            try testing.expectEqualStrings("artifacts/kernel-contain-arm64", a.local_path);
         },
         .x86_64 => {
             const a = hostAsset().?;
-            try testing.expectEqualStrings("vmlinux-contain-x86_64.gz", a.url_name);
-            try testing.expectEqualStrings("artifacts/vmlinux-contain", a.local_path);
+            try testing.expectEqualStrings("kernel-contain-x86_64.gz", a.url_name);
+            try testing.expectEqualStrings("artifacts/kernel-contain-x86_64", a.local_path);
         },
         else => try testing.expect(hostAsset() == null),
     }

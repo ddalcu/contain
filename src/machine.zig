@@ -611,6 +611,12 @@ pub const Machine = struct {
         if (self.natp) |nat| try nat.addHostForward(host_port, guest_port);
     }
 
+    /// Register a compose inter-service forward on the NAT (guest connections to
+    /// `vip:cport` are relayed to 127.0.0.1:hport, where a peer service listens).
+    pub fn addServiceForward(self: *Machine, vip: [4]u8, cport: u16, hport: u16) !void {
+        if (self.natp) |nat| try nat.addServiceForward(vip, cport, hport);
+    }
+
     /// Ask the running guest to stop. Safe to call from another thread: it sets the
     /// cooperative flag the accel loop polls, then kicks the vCPU out of any
     /// blocking hypervisor run so the loop notices the flag promptly.

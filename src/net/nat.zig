@@ -174,6 +174,13 @@ const ReaderCtx = struct {
     is_tcp: bool,
 };
 
+/// A compose inter-service forward. The guest reaches a peer service at
+/// `vip:cport` — a virtual IP in the guest subnet that /etc/hosts resolves the
+/// service name to — and the NAT relays it to 127.0.0.1:hport on the host, where
+/// that peer's own guest has published its container port `cport`. This is how
+/// services on separate guests (each its own NAT) talk to each other by name.
+const SvcFwd = struct { vip: [4]u8, cport: u16, hport: u16 };
+
 pub const Nat = struct {
     alloc: std.mem.Allocator,
     io: std.Io = undefined,
@@ -196,9 +203,32 @@ pub const Nat = struct {
     ephem_next: u16 = 40000,
     // Set by deinit so accept threads, once woken, exit instead of accepting.
     closing: std.atomic.Value(bool) = .{ .raw = false },
+    // compose inter-service forwards (peer service vip:cport -> host loopback port)
+    svc_fwds: std.ArrayListUnmanaged(SvcFwd) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, guest_mac: [6]u8) Nat {
         return .{ .alloc = alloc, .guest_mac = guest_mac, .have_guest_mac = true };
+    }
+
+    /// Register a compose inter-service forward: guest connections to the virtual
+    /// service address `vip:cport` are relayed to 127.0.0.1:hport on the host.
+    /// Also makes the NAT answer ARP for `vip` so the guest can address it.
+    pub fn addServiceForward(self: *Nat, vip: [4]u8, cport: u16, hport: u16) !void {
+        try self.svc_fwds.append(self.alloc, .{ .vip = vip, .cport = cport, .hport = hport });
+    }
+
+    /// If `dst:dport` is a registered service address, return the host loopback
+    /// port to relay it to; else null (a normal outbound connect).
+    pub fn lookupService(self: *Nat, dst: [4]u8, dport: u16) ?u16 {
+        for (self.svc_fwds.items) |sf| {
+            if (sf.cport == dport and std.mem.eql(u8, &sf.vip, &dst)) return sf.hport;
+        }
+        return null;
+    }
+
+    fn isServiceIp(self: *Nat, ip: [4]u8) bool {
+        for (self.svc_fwds.items) |sf| if (std.mem.eql(u8, &sf.vip, &ip)) return true;
+        return false;
     }
 
     /// Publish host TCP `host_port` and bridge each connection to the guest's
@@ -373,6 +403,7 @@ pub const Nat = struct {
         self.listeners.deinit(self.alloc);
         self.accepts.deinit(self.alloc);
         self.rx.deinit(self.alloc);
+        self.svc_fwds.deinit(self.alloc);
     }
 
     fn enqueue(self: *Nat, frame: []const u8) void {
@@ -601,7 +632,9 @@ pub const Nat = struct {
         if (p.len < 28) return;
         if (be16(p[6..8]) != 1) return; // requests only
         const target_ip = p[24..28];
-        if (!std.mem.eql(u8, target_ip, &gateway_ip) and !std.mem.eql(u8, target_ip, &dns_ip)) return;
+        // Answer for the gateway, the DNS server, and any registered inter-service
+        // virtual IP (all reachable through this NAT / the gateway MAC).
+        if (!std.mem.eql(u8, target_ip, &gateway_ip) and !std.mem.eql(u8, target_ip, &dns_ip) and !self.isServiceIp(target_ip[0..4].*)) return;
         var buf: [42]u8 = undefined;
         writeEthHdr(&buf, self.guest_mac, gw_mac, 0x0806);
         const a = buf[eth_hdr_len..];
@@ -742,7 +775,14 @@ pub const Nat = struct {
         const existing = self.findTcp(sport, dst, dport);
         if (existing == null) {
             if (flags & SYN == 0) return;
-            const to = net.IpAddress{ .ip4 = .{ .bytes = dst, .port = dport } };
+            // A compose inter-service address is relayed to the peer's published
+            // host loopback port; everything else dials the real dst directly.
+            // The TcpConn still keys on dst:dport so replies carry the vip the
+            // guest connected to.
+            const to = if (self.lookupService(dst, dport)) |hport|
+                net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = hport } }
+            else
+                net.IpAddress{ .ip4 = .{ .bytes = dst, .port = dport } };
             const stream = to.connect(self.io, .{ .mode = .stream }) catch {
                 self.sendTcp(dst, dport, sport, self.isn, seq +% 1, RST | ACK, &.{});
                 return;

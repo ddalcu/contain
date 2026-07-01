@@ -460,8 +460,14 @@ pub const VirtioFs = struct {
             FUSE_ACCESS => {}, // permissive
             FUSE_GETLK => self.opGetlk(body, &r),
             FUSE_SETLK, FUSE_SETLKW => {}, // grant (client-side VFS enforces mutual excl.)
-            FUSE_GETXATTR, FUSE_LISTXATTR => r.err = ENODATA,
-            FUSE_SETXATTR, FUSE_REMOVEXATTR => r.err = ENOSYS,
+            FUSE_GETXATTR => r.err = ENODATA, // no such attribute (image files carry none)
+            // LISTXATTR must be ENOSYS, NOT ENODATA: overlayfs copy-up runs a
+            // listxattr on the lower (this) file and treats a hard error like
+            // ENODATA as fatal, aborting the copy-up — so any write to an existing
+            // image file (e.g. the init appending /etc/hosts, /etc/resolv.conf)
+            // fails with ENODATA. ENOSYS tells the FUSE layer xattrs are
+            // unsupported, and copy-up then simply skips them.
+            FUSE_LISTXATTR, FUSE_SETXATTR, FUSE_REMOVEXATTR => r.err = ENOSYS,
             FUSE_LSEEK => self.opLseek(nodeid, body, &r),
             FUSE_INTERRUPT, FUSE_DESTROY, FUSE_BMAP => {},
             else => r.err = ENOSYS,
@@ -1170,6 +1176,34 @@ test "virtio-fs: FUSE_INIT negotiates version and max_write" {
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, out[16..20], .little)); // major
     try testing.expectEqual(@as(u32, 31), std.mem.readInt(u32, out[20..24], .little)); // min(40,31)
     try testing.expectEqual(@as(u32, 128 * 1024), std.mem.readInt(u32, out[36..40], .little)); // max_write
+}
+
+test "virtio-fs: LISTXATTR reports ENOSYS (not ENODATA) so overlayfs copy-up works" {
+    const alloc = testing.allocator;
+    const cwd = std.Io.Dir.cwd();
+    var tio0 = std.Io.Threaded.init(alloc, .{});
+    defer tio0.deinit();
+    const dir = "zig-vfs-xattr-tmp";
+    cwd.deleteTree(tio0.io(), dir) catch {};
+    try cwd.createDirPath(tio0.io(), dir);
+    defer cwd.deleteTree(tio0.io(), dir) catch {};
+    const t = try TestFs.init(alloc, dir);
+    defer t.deinit(alloc);
+
+    var in: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    // fuse_getxattr_in: size(u32) + padding(u32).
+    const xattr_in: [8]u8 = [_]u8{0} ** 8;
+    // LISTXATTR must be ENOSYS: overlayfs copy-up lists xattrs on the lower file and
+    // treats ENODATA as fatal, which would abort copy-up (writes to existing image
+    // files then fail). ENOSYS => the FUSE layer skips xattrs and copy-up proceeds.
+    const lreq = mkReq(&in, FUSE_LISTXATTR, 7, 1, &xattr_in);
+    _ = t.fs.dispatch(lreq, &out);
+    try testing.expectEqual(-@as(i32, ENOSYS), std.mem.readInt(i32, out[4..8], .little));
+    // GETXATTR keeps ENODATA (correct "no such attribute" semantics).
+    const greq = mkReq(&in, FUSE_GETXATTR, 8, 1, &xattr_in);
+    _ = t.fs.dispatch(greq, &out);
+    try testing.expectEqual(-@as(i32, ENODATA), std.mem.readInt(i32, out[4..8], .little));
 }
 
 test "virtio-fs: LOOKUP + READ round-trip a host file" {

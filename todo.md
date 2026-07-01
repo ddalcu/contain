@@ -37,7 +37,7 @@ interpreter (`cpu.zig`) + JIT (`jit.zig`) + `accel=interp` have been **removed**
   triple-fault; no MP table→no IOAPIC/timer; PCI-scan storm (`pci=off`); + TSS/
   identity map. The **firecracker CI kernels dead-end** (no-acpi: early-mm
   direct-map bootstrap fault; with-acpi: hangs in acpi_init) — so we **build our
-  own**: `tools/build_x86_kernel.sh` → `artifacts/vmlinux-contain` (linux 6.6.58,
+  own**: `tools/build_x86_kernel.sh` → `artifacts/kernel-contain-x86_64` (linux 6.6.58,
   PVH + virtio-mmio-cmdline + 9p + 8250, deferred-struct-page-init/NUMA/KASLR off,
   needs gcc-13). See memory `contain-x86-kvm-boot`.
 - **Phase 4 (WHP, Windows): DONE & PROVEN on this Windows host.** `src/accel/whp.zig`
@@ -50,7 +50,7 @@ interpreter (`cpu.zig`) + JIT (`jit.zig`) + `accel=interp` have been **removed**
 - **Phase 5 (OCI/Docker pull + unpack + run): WORKING on HVF + KVM + WHP, from
   scratch.** `contain pull <img> <dir>` and `contain oci <img> [-- cmd]` pull public
   Docker Hub images (no external tools) and run them; `cmdRunOci` now picks the
-  host-arch kernel (x86 vmlinux-contain → KVM/WHP, arm64 Image-arm64 → HVF). **Proven
+  host-arch kernel (x86 kernel-contain-x86_64 → KVM/WHP, arm64 kernel-contain-arm64 → HVF). **Proven
   end-to-end: `contain oci node:22-alpine -- node …` pulls the real amd64 node image
   and runs node v22.23.1** — a V8-JIT + OpenSSL stress test is byte-correct on KVM
   (Linux), and node runs on WHP (Windows). Two real bugs fixed: OCI argv was written
@@ -100,7 +100,7 @@ explicit ask).
 - `src/tests.zig` — tests for the 16550, the GIC inject hook, and PVH.
 
 ### How it runs
-- arm64 (this mac): `CONTAIN_ACCEL=hvf ./zig-out/bin/contain boot artifacts/Image-arm64 <cpio> [tty]`
+- arm64 (this mac): `CONTAIN_ACCEL=hvf ./zig-out/bin/contain boot artifacts/kernel-contain-arm64 <cpio> [tty]`
 - x86 (on a KVM host): `./zig-out/bin/contain boot <vmlinux> <initramfs>` — the ELF
   magic selects the x86-microvm platform; defaults to `accel=kvm`.
 - Default `accel` is the host's native backend (`accel.autoDefault`): HVF on Apple
@@ -158,7 +158,7 @@ testable) and Windows is the **WHP** target (Phase 4).
    longer owns a `Cpu`/dcache/code_bits (and dropped the `updateIrqs`/`serviceNet`
    interpreter callbacks); the shared `IrqLine` moved to `src/devices/gicv2.zig`.
    `zig build test` green (18/18); x86_64/aarch64-linux + x86_64-windows
-   cross-compile; HVF boot of `artifacts/Image-arm64` validated end-to-end
+   cross-compile; HVF boot of `artifacts/kernel-contain-arm64` validated end-to-end
    (virtio-blk/9p/NAT + clean poweroff). Removed ~6.4k lines of `src/` + the
    neonfuzz tooling. See memory `contain-pivot-hardware-virt`.
 6. **Phase 5 (OCI pipeline): DONE for the pull/unpack/run core (from scratch, no
@@ -167,7 +167,7 @@ testable) and Windows is the **WHP** target (Phase 4).
    / tar). `contain pull <img> <dir> [arch]` and `contain oci [-p host:guest]
    <img> [-- cmd]` (main.zig: pull → pack rootfs into the initramfs as root →
    boot the host-arch kernel). **Runs on KVM + WHP + HVF**; `oci -p` wires the NAT
-   hostfwd; x86 uses `vmlinux-contain` (`tools/build_x86_kernel.sh`). 9p
+   hostfwd; x86 uses `kernel-contain-x86_64` (`tools/build_x86_kernel.sh`). 9p
    `Tsetattr`/`Tmkdir`/`Tsymlink`/`Treadlink` are now implemented (writes work),
    and the Windows unpack records symlinks in a sidecar (no on-disk symlinks).
    Remaining polish: (a) the rootfs is packed into RAM (initramfs) — fine to
