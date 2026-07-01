@@ -274,6 +274,19 @@ built-in kernel.
   rebuild native before running locally (`exec format error` = a stale cross
   binary). On aarch64-macOS the native build re-signs with the HVF entitlement.
 
+**virtio-fs (rootfs-over-virtiofs) invariants**
+- The x86 guest has **no working RTC** (emulated CMOS is a fixed time; `rtc_cmos`
+  probe fails), so the clock starts near the epoch and **TLS cert validation fails**
+  ("certificate not trusted") for apk/pip/npm over HTTPS. The generated init bakes
+  `date -s @<host-epoch>` (via `hostEpochSecs`) to set a sane clock — don't remove it.
+- **Windows can't create real symlinks** at runtime either: `VirtioFs.opSymlink`
+  records a placeholder + `.contain-symlinks` sidecar/map entry (like the OCI unpack)
+  instead of a host `symlink()`. Without it, `apk add`/`dpkg` fail EACCES creating
+  `.so`-version links. `attrOf`/READLINK/READDIR are symlink-sidecar aware.
+- rootfs-over-virtiofs boots via `root=rootfs rootfstype=virtiofs rw rootwait
+  init=<per-run-unique>`; the init must `mount devtmpfs /dev` then
+  `exec </dev/console >/dev/console 2>&1` (the image `/dev` has no console at exec).
+
 **Device / boot invariants**
 - virtio probe (arm64, emulated GICv2) needs **GICv2 ICFGR** (edge/level config),
   and clean power-off + disk writeback needs **PSCI** `SYSTEM_OFF` (HVF's

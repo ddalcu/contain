@@ -167,7 +167,8 @@ pub const VirtioFs = struct {
     // placeholder file at each path. We load it so the guest sees real symlinks
     // (essential: /bin/sh -> busybox etc. are symlinks in every container image).
     symlinks: std.StringHashMap([]const u8),
-    sidecar: []u8 = &.{}, // owned backing bytes for the symlink map
+    sidecar: []u8 = &.{}, // owned backing bytes for the sidecar-loaded symlink map
+    dyn: std.heap.ArenaAllocator, // owns runtime-created (Windows) symlink map entries
 
     status: u32 = 0,
     device_features_sel: u32 = 0,
@@ -195,6 +196,7 @@ pub const VirtioFs = struct {
             .nodes = std.AutoHashMap(u64, Node).init(alloc),
             .by_path = std.StringHashMap(u64).init(alloc),
             .symlinks = std.StringHashMap([]const u8).init(alloc),
+            .dyn = std.heap.ArenaAllocator.init(alloc),
         };
         self.in_buf = try alloc.alloc(u8, 160 * 1024);
         self.out_buf = try alloc.alloc(u8, 160 * 1024);
@@ -230,6 +232,7 @@ pub const VirtioFs = struct {
         self.nodes.deinit();
         self.by_path.deinit();
         self.symlinks.deinit();
+        self.dyn.deinit();
         if (self.sidecar.len != 0) self.alloc.free(self.sidecar);
         self.alloc.free(self.in_buf);
         self.alloc.free(self.out_buf);
@@ -570,11 +573,51 @@ pub const VirtioFs = struct {
         const target = cstr(body[name.len + 1 ..]);
         const child = self.childPath(parent, name) catch return r.setErr(EIO);
         defer self.alloc.free(child);
-        std.Io.Dir.cwd().symLink(self.io, target, self.hostPath(child), .{}) catch return r.setErr(EACCES);
+        if (builtin.os.tag == .windows) {
+            // Windows can't create real symlinks in the shared dir (needs privilege),
+            // so record it exactly like the OCI unpack: an empty placeholder file +
+            // a `.contain-symlinks` sidecar / in-memory map entry, so it reads back as
+            // a symlink. Essential — apk/dpkg/pip create .so-version symlinks at
+            // install time, which would otherwise fail EACCES.
+            self.recordSymlink(child, target) catch return r.setErr(EIO);
+        } else {
+            std.Io.Dir.cwd().symLink(self.io, target, self.hostPath(child), .{}) catch return r.setErr(EACCES);
+        }
         const id = self.intern(child, false) catch return r.setErr(EIO);
         var o = r.payload();
         self.putEntry(&o, id, .{ .kind = .link, .size = target.len });
         r.commit(o);
+    }
+
+    /// Record a Windows "virtual" symlink: a 0-byte placeholder on disk (so it lists
+    /// + stats), an in-memory map entry (so it reads back as a link this session),
+    /// and an appended `.contain-symlinks` sidecar line (so a later boot of the same
+    /// rootfs — e.g. the next `contain build` RUN step, or `run` of a built image —
+    /// still sees it). Dynamic entries own their bytes in `dyn`.
+    fn recordSymlink(self: *VirtioFs, rel: []const u8, target: []const u8) !void {
+        // Placeholder file (truncate: overwrite any prior content, e.g. a real file
+        // being replaced by a symlink during a package upgrade).
+        var f = try std.Io.Dir.cwd().createFile(self.io, self.hostPath(rel), .{ .truncate = true });
+        f.close(self.io);
+        const a = self.dyn.allocator();
+        const k = try a.dupe(u8, rel);
+        const v = try a.dupe(u8, target);
+        try self.symlinks.put(k, v);
+        // Append to the sidecar so it survives this device's lifetime.
+        const line = std.fmt.allocPrint(self.alloc, "{s}\t{s}\n", .{ rel, target }) catch return;
+        defer self.alloc.free(line);
+        self.appendSidecar(line) catch {};
+    }
+
+    fn appendSidecar(self: *VirtioFs, line: []const u8) !void {
+        var pbuf: [4096]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/.contain-symlinks", .{self.base});
+        const cwd = std.Io.Dir.cwd();
+        var file = cwd.openFile(self.io, path, .{ .mode = .read_write }) catch
+            try cwd.createFile(self.io, path, .{ .truncate = false });
+        defer file.close(self.io);
+        const end = (file.stat(self.io) catch return).size;
+        try file.writePositionalAll(self.io, line, end);
     }
 
     fn opMknod(self: *VirtioFs, parent: u64, body: []const u8, r: *Reply) void {

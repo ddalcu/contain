@@ -805,10 +805,10 @@ fn shellQuote(w: *std.Io.Writer, arg: []const u8) !void {
     try w.writeAll("' ");
 }
 
-fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts) ![]const u8 {
+fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, epoch: i64) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
-    try w.writeAll(
+    try w.print(
         \\#!/bin/sh
         \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
         \\mkdir -p /proc /sys /dev 2>/dev/null
@@ -819,6 +819,12 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\# image's /dev has no console at exec time (unlike the kernel's initramfs),
         \\# so without this every command's output would be lost.
         \\exec </dev/console >/dev/console 2>&1
+        \\# Set a sane clock from the host (the guest has no working RTC), so TLS
+        \\# certificate validation works for apk/pip/npm over HTTPS.
+        \\date -s @{d} >/dev/null 2>&1 || date -u -s "@{d}" >/dev/null 2>&1
+        \\
+    , .{ epoch, epoch });
+    try w.writeAll(
         \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
         \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
         \\ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null
@@ -1246,7 +1252,7 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
         std.debug.print("[oci] cached image at {s}\n", .{entry});
     }
 
-    const init_script = try buildOciInit(arena, cfg, opts);
+    const init_script = try buildOciInit(arena, cfg, opts, hostEpochSecs(io));
     const kernel = kernel_fetch.defaultKernelPath();
     const input: []const u8 = if (opts.interactive) "tty" else "-";
 
@@ -1411,7 +1417,7 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
                 const parsed = try build_mod.parseExecOrShell(arena, ins.args);
                 const shell_cmd = if (parsed.is_exec) try joinArgv(arena, parsed.argv) else parsed.argv[0];
                 std.debug.print("[build] RUN {s}\n", .{shell_cmd});
-                const init_script = try buildStepInit(arena, bc.env.items, nullIfEmpty(bc.workdir), shell_cmd);
+                const init_script = try buildStepInit(arena, bc.env.items, nullIfEmpty(bc.workdir), shell_cmd, hostEpochSecs(io));
                 const init_path = try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir});
                 try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
                 const status_path = try std.fmt.allocPrint(arena, "{s}/.contain-build-status", .{rootfs_dir});
@@ -1493,6 +1499,16 @@ fn nullIfEmpty(s: []const u8) ?[]const u8 {
     return if (s.len == 0) null else s;
 }
 
+/// The host's current wall-clock time in Unix seconds. Baked into the guest init
+/// (`date -s @<epoch>`) because the x86 guest has no working RTC (the emulated CMOS
+/// presents a fixed time and the kernel's rtc_cmos probe fails), leaving the guest
+/// clock near the epoch — which makes TLS certificate validation fail (apk/pip/npm
+/// over HTTPS report "certificate not trusted"). Setting a sane clock fixes it.
+fn hostEpochSecs(io: std.Io) i64 {
+    const ns = std.Io.Clock.now(.real, io).nanoseconds;
+    return @intCast(@divFloor(ns, std.time.ns_per_s));
+}
+
 /// This process's OS process id — a per-process unique token (used to name each
 /// run's guest init file so concurrent guests off one shared image rootfs don't
 /// collide). Each `contain run` is its own process, incl. `compose`'s children.
@@ -1528,10 +1544,10 @@ fn joinArgv(a: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
 /// The `/.contain-init` a RUN step boots: bring up mounts/console/networking, apply
 /// the accumulated ENV + WORKDIR, run the command, record its exit status to a
 /// host-readable file, and power off.
-fn buildStepInit(arena: std.mem.Allocator, env: []const []const u8, workdir: ?[]const u8, command: []const u8) ![]const u8 {
+fn buildStepInit(arena: std.mem.Allocator, env: []const []const u8, workdir: ?[]const u8, command: []const u8, epoch: i64) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
-    try w.writeAll(
+    try w.print(
         \\#!/bin/sh
         \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
         \\mkdir -p /proc /sys /dev 2>/dev/null
@@ -1539,6 +1555,10 @@ fn buildStepInit(arena: std.mem.Allocator, env: []const []const u8, workdir: ?[]
         \\mount -t sysfs sysfs /sys 2>/dev/null
         \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
         \\exec </dev/console >/dev/console 2>&1
+        \\date -s @{d} >/dev/null 2>&1 || date -u -s "@{d}" >/dev/null 2>&1
+        \\
+    , .{ epoch, epoch });
+    try w.writeAll(
         \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null
         \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
         \\ip link set eth0 up 2>/dev/null
