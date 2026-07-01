@@ -64,7 +64,8 @@ pub const Machine = struct {
     disk: []u8,
     rng: *VirtioRng,
     p9: ?*Virtio9p = null,
-    vfs: ?*VirtioFs = null,
+    vfs: ?*VirtioFs = null, // the -v/host share device (tag "host"), if any
+    rootfs_vfs: ?*VirtioFs = null, // the rootfs-over-virtiofs device (tag "rootfs"), if any
     net: ?*VirtioNet = null,
     natp: ?*Nat = null,
     net_io: ?*std.Io.Threaded = null,
@@ -88,7 +89,7 @@ pub const Machine = struct {
     input: []const u8 = "",
     input_pos: usize = 0,
 
-    pub fn init(alloc: std.mem.Allocator, io: std.Io, ram_size: usize, share_path: ?[]const u8, enable_net: bool, rng_seed: [32]u8) !*Machine {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, ram_size: usize, share_path: ?[]const u8, rootfs_share: ?[]const u8, enable_net: bool, rng_seed: [32]u8) !*Machine {
         const self = try alloc.create(Machine);
         errdefer alloc.destroy(self);
 
@@ -101,6 +102,7 @@ pub const Machine = struct {
         self.x86_cmdline = null;
         self.p9 = null;
         self.vfs = null;
+        self.rootfs_vfs = null;
         self.net = null;
         self.natp = null;
         self.net_io = null;
@@ -192,6 +194,15 @@ pub const Machine = struct {
             vidx += 1;
         }
 
+        // Optional rootfs-over-virtiofs (see initX86): the container rootfs dir as
+        // the guest's real root, demand-paged. The arm64 bootargs (built with the
+        // DTB in cmdBoot) select root=rootfs rootfstype=virtiofs when this is set.
+        if (rootfs_share) |rp| {
+            const slot = virtio_base + virtio_stride * vidx;
+            self.rootfs_vfs = try self.addShareDevice(alloc, io, gic, slot, 32 + virtio_spi + vidx, rp, "rootfs", true);
+            vidx += 1;
+        }
+
         // Optional host-directory share: virtio-fs by default (POSIX-complete,
         // memory-lean), or legacy 9p if CONTAIN_SHARE_FS=9p.
         if (share_path) |sp| {
@@ -199,7 +210,7 @@ pub const Machine = struct {
                 var d = dir;
                 d.close(io); // just verifying it exists; the device uses cwd-relative paths
                 const slot = virtio_base + virtio_stride * vidx;
-                try self.addShareDevice(alloc, io, gic, slot, 32 + virtio_spi + vidx, sp);
+                self.vfs = try self.addShareDevice(alloc, io, gic, slot, 32 + virtio_spi + vidx, sp, "host", false);
                 vidx += 1;
             } else |err| {
                 std.debug.print("[contain] share '{s}' unavailable: {s}\n", .{ sp, @errorName(err) });
@@ -240,30 +251,34 @@ pub const Machine = struct {
     /// legacy 9p transport. Both are virtio-mmio, so the DTB/cmdline node is
     /// identical either way — only the guest-side `mount -t` differs (the init
     /// scripts try virtiofs then 9p).
-    fn addShareDevice(self: *Machine, alloc: std.mem.Allocator, io: std.Io, gic: *Gicv2, slot: u64, irq: u32, path: []const u8) !void {
+    fn addShareDevice(self: *Machine, alloc: std.mem.Allocator, io: std.Io, gic: *Gicv2, slot: u64, irq: u32, path: []const u8, tag: []const u8, force_virtiofs: bool) !?*VirtioFs {
         const win: u64 = if (self.platform == .x86_microvm) x86_virtio_size else VirtioFs.size;
-        if (useVirtiofs(alloc)) {
+        if (force_virtiofs or useVirtiofs(alloc)) {
             const vfs = try alloc.create(VirtioFs);
-            vfs.* = try VirtioFs.init(slot, irq, &self.bus, gic, io, path, "host", alloc);
-            self.vfs = vfs;
+            vfs.* = try VirtioFs.init(slot, irq, &self.bus, gic, io, path, tag, alloc);
             try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = vfs, .readFn = vfsRead, .writeFn = vfsWrite, .name = "virtio-fs" });
-        } else {
-            const p9 = try alloc.create(Virtio9p);
-            p9.* = Virtio9p.init(slot, irq, &self.bus, gic, io, path, alloc);
-            self.p9 = p9;
-            try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = p9, .readFn = p9Read, .writeFn = p9Write, .name = "virtio-9p" });
+            return vfs;
         }
+        const p9 = try alloc.create(Virtio9p);
+        p9.* = Virtio9p.init(slot, irq, &self.bus, gic, io, path, alloc);
+        self.p9 = p9;
+        try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = p9, .readFn = p9Read, .writeFn = p9Write, .name = "virtio-9p" });
+        return null;
     }
 
-    /// Default the host share to virtio-fs; CONTAIN_SHARE_FS=9p forces legacy 9p.
-    /// (Env override honored on POSIX hosts; Windows always gets the virtio-fs
-    /// default, which is the target transport there anyway.)
+    /// Choose the host-share transport. CONTAIN_SHARE_FS=virtiofs|9p forces it
+    /// (honored on POSIX hosts). Default: virtio-fs on x86 — where contain ships a
+    /// FUSE-enabled guest kernel — and 9p on arm64 until the arm64 FUSE kernel is
+    /// released (the current arm64 release kernel has no CONFIG_VIRTIO_FS).
     fn useVirtiofs(alloc: std.mem.Allocator) bool {
         _ = alloc;
         if (builtin.os.tag != .windows) {
-            if (std.posix.getenv("CONTAIN_SHARE_FS")) |v| return !std.mem.eql(u8, v, "9p");
+            if (std.posix.getenv("CONTAIN_SHARE_FS")) |v| {
+                if (std.mem.eql(u8, v, "9p")) return false;
+                if (std.mem.eql(u8, v, "virtiofs")) return true;
+            }
         }
-        return true;
+        return builtin.cpu.arch == .x86_64;
     }
 
     fn appendVirtioCmd(cmd: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, base: u64, gsi: u32) !void {
@@ -277,7 +292,7 @@ pub const Machine = struct {
     /// GIC-MMIO/DTB. The interrupt controller is the hypervisor's in-kernel
     /// IOAPIC; the GICv2 here serves only as the IRQ router (its `inject_fn` is
     /// set by the backend to hit the IOAPIC GSI). Runs under KVM/WHP only.
-    pub fn initX86(alloc: std.mem.Allocator, io: std.Io, ram_size: usize, share_path: ?[]const u8, enable_net: bool, rng_seed: [32]u8, for_whp: bool) !*Machine {
+    pub fn initX86(alloc: std.mem.Allocator, io: std.Io, ram_size: usize, share_path: ?[]const u8, rootfs_share: ?[]const u8, enable_net: bool, rng_seed: [32]u8, for_whp: bool) !*Machine {
         const self = try alloc.create(Machine);
         errdefer alloc.destroy(self);
 
@@ -290,6 +305,7 @@ pub const Machine = struct {
         self.x86_cmdline = null;
         self.p9 = null;
         self.vfs = null;
+        self.rootfs_vfs = null;
         self.net = null;
         self.natp = null;
         self.net_io = null;
@@ -323,7 +339,15 @@ pub const Machine = struct {
         errdefer cmd.deinit(alloc);
         // pci=off: there is no PCI host bridge in this microvm, so stop the kernel
         // scanning 0xCF8/0xCFC (a full bus enumeration spins forever otherwise).
-        try cmd.appendSlice(alloc, "console=ttyS0 reboot=t panic=-1 pci=off acpi=off rdinit=/init");
+        // With a rootfs-over-virtiofs share the kernel mounts the host rootfs dir
+        // directly as its real root (demand-paged — no whole-image-in-RAM initramfs),
+        // and runs /.contain-init from it. `rootwait` lets the virtio-fs device probe
+        // before mount_root. Otherwise boot the initramfs root via rdinit=/init.
+        try cmd.appendSlice(alloc, "console=ttyS0 reboot=t panic=-1 pci=off acpi=off");
+        if (rootfs_share != null)
+            try cmd.appendSlice(alloc, " root=rootfs rootfstype=virtiofs rw rootwait init=/.contain-init")
+        else
+            try cmd.appendSlice(alloc, " rdinit=/init");
         // WHP only emulates the LAPIC (no working LAPIC timer for us) and no PIC, so
         // the guest must use the i8254 PIT for the tick: disable the APIC timer,
         // force periodic mode, and skip the IRQ-routing check. KVM has an in-kernel
@@ -359,6 +383,17 @@ pub const Machine = struct {
             vidx += 1;
         }
 
+        // Optional rootfs-over-virtiofs: the container's unpacked rootfs dir mounted
+        // as the guest's real root (tag "rootfs"), demand-paged instead of packed
+        // into an in-RAM initramfs. Always virtio-fs (root=... rootfstype=virtiofs).
+        if (rootfs_share) |rp| {
+            const slot = x86_virtio_base + x86_virtio_stride * vidx;
+            const gsi = x86_virtio_gsi0 + vidx;
+            self.rootfs_vfs = try self.addShareDevice(alloc, io, gic, slot, gsi, rp, "rootfs", true);
+            try appendVirtioCmd(&cmd, alloc, slot, gsi);
+            vidx += 1;
+        }
+
         // Optional host-directory share: virtio-fs by default, or legacy 9p if
         // CONTAIN_SHARE_FS=9p.
         if (share_path) |sp| {
@@ -367,7 +402,7 @@ pub const Machine = struct {
                 d.close(io);
                 const slot = x86_virtio_base + x86_virtio_stride * vidx;
                 const gsi = x86_virtio_gsi0 + vidx;
-                try self.addShareDevice(alloc, io, gic, slot, gsi, sp);
+                self.vfs = try self.addShareDevice(alloc, io, gic, slot, gsi, sp, "host", false);
                 try appendVirtioCmd(&cmd, alloc, slot, gsi);
                 vidx += 1;
             } else |err| {
@@ -437,6 +472,10 @@ pub const Machine = struct {
             self.alloc.destroy(p9);
         }
         if (self.vfs) |vfs| {
+            vfs.deinit();
+            self.alloc.destroy(vfs);
+        }
+        if (self.rootfs_vfs) |vfs| {
             vfs.deinit();
             self.alloc.destroy(vfs);
         }

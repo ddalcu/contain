@@ -20,6 +20,7 @@
 //! table with lookup refcounts so FORGET frees them.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Bus = @import("../bus.zig").Bus;
 const Gicv2 = @import("gicv2.zig").Gicv2;
 
@@ -161,6 +162,13 @@ pub const VirtioFs = struct {
     by_path: std.StringHashMap(u64),
     next_nodeid: u64 = 2, // 1 is root
 
+    // Windows can't create on-disk symlinks, so the OCI unpack records them in a
+    // `.contain-symlinks` sidecar (relative-path\ttarget) and leaves an empty
+    // placeholder file at each path. We load it so the guest sees real symlinks
+    // (essential: /bin/sh -> busybox etc. are symlinks in every container image).
+    symlinks: std.StringHashMap([]const u8),
+    sidecar: []u8 = &.{}, // owned backing bytes for the symlink map
+
     status: u32 = 0,
     device_features_sel: u32 = 0,
     queue_sel: u32 = 0,
@@ -186,6 +194,7 @@ pub const VirtioFs = struct {
             .alloc = alloc,
             .nodes = std.AutoHashMap(u64, Node).init(alloc),
             .by_path = std.StringHashMap(u64).init(alloc),
+            .symlinks = std.StringHashMap([]const u8).init(alloc),
         };
         self.in_buf = try alloc.alloc(u8, 160 * 1024);
         self.out_buf = try alloc.alloc(u8, 160 * 1024);
@@ -193,7 +202,26 @@ pub const VirtioFs = struct {
         const root_path = try alloc.dupe(u8, "");
         try self.nodes.put(ROOT_NODEID, .{ .path = root_path, .nlookup = 1, .is_dir = true });
         try self.by_path.put(root_path, ROOT_NODEID);
+        // Load the Windows symlink sidecar, if present (harmless empty on POSIX).
+        self.loadSymlinkSidecar(io) catch {};
         return self;
+    }
+
+    /// Parse `<base>/.contain-symlinks` (lines of "relpath\ttarget") into the map.
+    /// The backing bytes are kept alive in `self.sidecar`; map keys/values point
+    /// into it. Paths use forward slashes (the OCI unpack normalizes them).
+    fn loadSymlinkSidecar(self: *VirtioFs, io: std.Io) !void {
+        var pbuf: [4096]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}/.contain-symlinks", .{self.base}) catch return;
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, self.alloc, .limited(16 * 1024 * 1024)) catch return;
+        self.sidecar = data;
+        var it = std.mem.tokenizeScalar(u8, data, '\n');
+        while (it.next()) |line0| {
+            // Strip a trailing CR (sidecar may have been written with CRLF).
+            const line = if (line0.len > 0 and line0[line0.len - 1] == '\r') line0[0 .. line0.len - 1] else line0;
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            self.symlinks.put(line[0..tab], line[tab + 1 ..]) catch {};
+        }
     }
 
     pub fn deinit(self: *VirtioFs) void {
@@ -201,8 +229,22 @@ pub const VirtioFs = struct {
         while (it.next()) |e| self.alloc.free(e.value_ptr.path);
         self.nodes.deinit();
         self.by_path.deinit();
+        self.symlinks.deinit();
+        if (self.sidecar.len != 0) self.alloc.free(self.sidecar);
         self.alloc.free(self.in_buf);
         self.alloc.free(self.out_buf);
+    }
+
+    /// The symlink target for a relative path, or null if it isn't a symlink.
+    /// Windows: from the sidecar. POSIX: a real host symlink (readLink succeeds
+    /// only on links), so contain works whether or not a sidecar was written.
+    fn symlinkTarget(self: *VirtioFs, rel: []const u8, buf: []u8) ?[]const u8 {
+        if (self.symlinks.get(rel)) |t| return t;
+        if (builtin.os.tag != .windows) {
+            const n = std.Io.Dir.cwd().readLink(self.io, self.hostPath(rel), buf) catch return null;
+            return buf[0..n];
+        }
+        return null;
     }
 
     fn hostPath(self: *VirtioFs, rel: []const u8) []const u8 {
@@ -449,12 +491,12 @@ pub const VirtioFs = struct {
 
     fn opGetattr(self: *VirtioFs, nodeid: u64, r: *Reply) void {
         const node = self.nodes.get(nodeid) orelse return r.setErr(ENOENT);
-        const st = self.statPath(node.path) catch return r.setErr(ENOENT);
+        const a = self.attrOf(node.path) catch return r.setErr(ENOENT);
         var o = r.payload();
         o.put64(3600); // attr_valid (sec)
         o.put32(0); // attr_valid_nsec
         o.put32(0); // dummy
-        self.putAttr(&o, nodeid, st);
+        self.putAttr(&o, nodeid, a);
         r.commit(o);
     }
 
@@ -462,10 +504,10 @@ pub const VirtioFs = struct {
         const name = cstr(body);
         const child = self.childPath(parent, name) catch return r.setErr(EIO);
         defer self.alloc.free(child);
-        const st = self.statPath(child) catch return r.setErr(ENOENT);
-        const id = self.intern(child, st.kind == .directory) catch return r.setErr(EIO);
+        const a = self.attrOf(child) catch return r.setErr(ENOENT);
+        const id = self.intern(child, a.kind == .dir) catch return r.setErr(EIO);
         var o = r.payload();
-        self.putEntry(&o, id, st);
+        self.putEntry(&o, id, a);
         r.commit(o);
     }
 
@@ -504,21 +546,21 @@ pub const VirtioFs = struct {
         }
         // mode/uid/gid/times accepted as no-ops (over-permissive sandbox), then
         // return the fresh attributes.
-        const st = self.statPath(node.path) catch return r.setErr(ENOENT);
+        const a = self.attrOf(node.path) catch return r.setErr(ENOENT);
         var o = r.payload();
         o.put64(3600);
         o.put32(0);
         o.put32(0);
-        self.putAttr(&o, nodeid, st);
+        self.putAttr(&o, nodeid, a);
         r.commit(o);
     }
 
     fn opReadlink(self: *VirtioFs, nodeid: u64, r: *Reply) void {
         const node = self.nodes.get(nodeid) orelse return r.setErr(ENOENT);
         var lbuf: [4096]u8 = undefined;
-        const n = std.Io.Dir.cwd().readLink(self.io, self.hostPath(node.path), &lbuf) catch return r.setErr(EINVAL);
+        const target = self.symlinkTarget(node.path, &lbuf) orelse return r.setErr(EINVAL);
         var o = r.payload();
-        o.putBytes(lbuf[0..n]); // no trailing NUL for READLINK
+        o.putBytes(target); // no trailing NUL for READLINK
         r.commit(o);
     }
 
@@ -529,10 +571,9 @@ pub const VirtioFs = struct {
         const child = self.childPath(parent, name) catch return r.setErr(EIO);
         defer self.alloc.free(child);
         std.Io.Dir.cwd().symLink(self.io, target, self.hostPath(child), .{}) catch return r.setErr(EACCES);
-        const st = self.statPath(child) catch return r.setErr(EIO);
         const id = self.intern(child, false) catch return r.setErr(EIO);
         var o = r.payload();
-        self.putEntry(&o, id, st);
+        self.putEntry(&o, id, .{ .kind = .link, .size = target.len });
         r.commit(o);
     }
 
@@ -544,10 +585,9 @@ pub const VirtioFs = struct {
         // Only regular files are supported (no device nodes in the sandbox share).
         var f = std.Io.Dir.cwd().createFile(self.io, self.hostPath(child), .{ .truncate = false, .exclusive = true }) catch return r.setErr(EEXIST);
         f.close(self.io);
-        const st = self.statPath(child) catch return r.setErr(EIO);
         const id = self.intern(child, false) catch return r.setErr(EIO);
         var o = r.payload();
-        self.putEntry(&o, id, st);
+        self.putEntry(&o, id, .{ .kind = .file, .size = 0 });
         r.commit(o);
     }
 
@@ -557,10 +597,9 @@ pub const VirtioFs = struct {
         const child = self.childPath(parent, name) catch return r.setErr(EIO);
         defer self.alloc.free(child);
         std.Io.Dir.cwd().createDirPath(self.io, self.hostPath(child)) catch return r.setErr(EEXIST);
-        const st = self.statPath(child) catch return r.setErr(EIO);
         const id = self.intern(child, true) catch return r.setErr(EIO);
         var o = r.payload();
-        self.putEntry(&o, id, st);
+        self.putEntry(&o, id, .{ .kind = .dir, .size = 0 });
         r.commit(o);
     }
 
@@ -673,19 +712,35 @@ pub const VirtioFs = struct {
             index += 1;
         }
         while (it.next(self.io) catch null) |e| {
+            // Hide contain's internal symlink sidecar (it's not part of the image).
+            if (std.mem.eql(u8, e.name, ".contain-symlinks")) continue;
             if (index < offset) {
                 index += 1;
                 continue;
             }
-            const dtype: u32 = switch (e.kind) {
+            var dtype: u32 = switch (e.kind) {
                 .directory => DT_DIR,
                 .sym_link => DT_LNK,
                 else => DT_REG,
             };
+            // A Windows placeholder file is really a symlink recorded in the sidecar.
+            if (dtype != DT_LNK and self.symlinks.count() != 0 and self.isRecordedSymlink(node.path, e.name))
+                dtype = DT_LNK;
             if (!putDirent(&o, cap, index + 1, index + 1, dtype, e.name)) break;
             index += 1;
         }
         r.commit(o);
+    }
+
+    /// Is `<dir>/<name>` recorded as a symlink in the sidecar map? (Cheap hashmap
+    /// lookup; builds the joined relative path into a stack buffer.)
+    fn isRecordedSymlink(self: *VirtioFs, dir: []const u8, name: []const u8) bool {
+        var buf: [4096]u8 = undefined;
+        const rel = if (dir.len == 0)
+            name
+        else
+            (std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch return false);
+        return self.symlinks.contains(rel);
     }
 
     fn opStatfs(self: *VirtioFs, r: *Reply) void {
@@ -713,10 +768,9 @@ pub const VirtioFs = struct {
         defer self.alloc.free(child);
         var f = std.Io.Dir.cwd().createFile(self.io, self.hostPath(child), .{ .truncate = true }) catch return r.setErr(EACCES);
         f.close(self.io);
-        const st = self.statPath(child) catch return r.setErr(EIO);
         const id = self.intern(child, false) catch return r.setErr(EIO);
         var o = r.payload();
-        self.putEntry(&o, id, st); // fuse_entry_out
+        self.putEntry(&o, id, .{ .kind = .file, .size = 0 }); // fuse_entry_out
         o.put64(0); // fuse_open_out.fh
         o.put32(0); // open_flags
         o.put32(0); // padding
@@ -798,20 +852,32 @@ pub const VirtioFs = struct {
         return std.Io.Dir.cwd().openDir(self.io, self.hostPath(path), .{ .iterate = true });
     }
 
+    const Kind = enum { file, dir, link };
+    const Attr = struct { kind: Kind, size: u64 };
+
+    /// The FUSE-visible attributes of a relative path. Checks the symlink map /
+    /// host symlink FIRST (so a link is reported as a link, with its target-string
+    /// length as the size — required for correct readlink), otherwise stats the
+    /// file/dir. Errors if the path doesn't exist.
+    fn attrOf(self: *VirtioFs, rel: []const u8) !Attr {
+        var lbuf: [4096]u8 = undefined;
+        if (self.symlinkTarget(rel, &lbuf)) |t| return .{ .kind = .link, .size = t.len };
+        const st = try self.statPath(rel);
+        return .{ .kind = if (st.kind == .directory) .dir else .file, .size = st.size };
+    }
+
     // ---- FUSE struct writers ------------------------------------------------
 
-    fn putAttr(self: *VirtioFs, o: *Payload, nodeid: u64, st: std.Io.Dir.Stat) void {
+    fn putAttr(self: *VirtioFs, o: *Payload, nodeid: u64, a: Attr) void {
         _ = self;
-        const is_dir = st.kind == .directory;
-        const is_link = st.kind == .sym_link;
-        const mode: u32 = blk: {
-            if (is_dir) break :blk 0o040755;
-            if (is_link) break :blk 0o120777;
-            break :blk 0o100755;
+        const mode: u32 = switch (a.kind) {
+            .dir => 0o040755,
+            .link => 0o120777,
+            .file => 0o100755,
         };
         o.put64(nodeid); // ino
-        o.put64(st.size); // size
-        o.put64((st.size + 511) / 512); // blocks
+        o.put64(a.size); // size
+        o.put64((a.size + 511) / 512); // blocks
         o.put64(0); // atime
         o.put64(0); // mtime
         o.put64(0); // ctime
@@ -819,7 +885,7 @@ pub const VirtioFs = struct {
         o.put32(0); // mtimensec
         o.put32(0); // ctimensec
         o.put32(mode); // mode
-        o.put32(if (is_dir) 2 else 1); // nlink
+        o.put32(if (a.kind == .dir) 2 else 1); // nlink
         o.put32(0); // uid
         o.put32(0); // gid
         o.put32(0); // rdev
@@ -827,14 +893,14 @@ pub const VirtioFs = struct {
         o.put32(0); // flags
     }
 
-    fn putEntry(self: *VirtioFs, o: *Payload, nodeid: u64, st: std.Io.Dir.Stat) void {
+    fn putEntry(self: *VirtioFs, o: *Payload, nodeid: u64, a: Attr) void {
         o.put64(nodeid); // nodeid
         o.put64(0); // generation
         o.put64(3600); // entry_valid
         o.put64(3600); // attr_valid
         o.put32(0); // entry_valid_nsec
         o.put32(0); // attr_valid_nsec
-        self.putAttr(o, nodeid, st); // fuse_attr
+        self.putAttr(o, nodeid, a); // fuse_attr
     }
 };
 
@@ -1109,6 +1175,42 @@ test "virtio-fs: READDIR lists entries including . and .." {
         off += (rec + 7) & ~@as(usize, 7);
     }
     try testing.expect(found_dot and found_dotdot and found_a);
+}
+
+test "virtio-fs: sidecar symlink is reported as a link and readlink returns target" {
+    const alloc = testing.allocator;
+    const cwd = std.Io.Dir.cwd();
+    var tio0 = std.Io.Threaded.init(alloc, .{});
+    defer tio0.deinit();
+    const dir = "zig-vfs-link-tmp";
+    cwd.deleteTree(tio0.io(), dir) catch {};
+    try cwd.createDirPath(tio0.io(), dir);
+    defer cwd.deleteTree(tio0.io(), dir) catch {};
+    // A 0-byte placeholder + a sidecar recording it as a symlink (the Windows OCI
+    // unpack shape). bin/sh -> /bin/busybox.
+    try cwd.createDirPath(tio0.io(), dir ++ "/bin");
+    try cwd.writeFile(tio0.io(), .{ .sub_path = dir ++ "/bin/sh", .data = "" });
+    try cwd.writeFile(tio0.io(), .{ .sub_path = dir ++ "/.contain-symlinks", .data = "bin/sh\t/bin/busybox\n" });
+
+    const t = try TestFs.init(alloc, dir);
+    defer t.deinit(alloc);
+
+    var in: [256]u8 = undefined;
+    var out: [4096]u8 = undefined;
+
+    // LOOKUP bin (dir), then sh under it.
+    _ = t.fs.dispatch(mkReq(&in, FUSE_LOOKUP, 2, ROOT_NODEID, "bin\x00"), &out);
+    const bin_id = std.mem.readInt(u64, out[16..24], .little);
+    _ = t.fs.dispatch(mkReq(&in, FUSE_LOOKUP, 3, bin_id, "sh\x00"), &out);
+    try testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, out[4..8], .little));
+    const sh_id = std.mem.readInt(u64, out[16..24], .little);
+    // attr.mode (fuse_attr @ payload+40, mode @ offset 60) must be S_IFLNK (0o120000).
+    const mode = std.mem.readInt(u32, out[16 + 40 + 60 ..][0..4], .little);
+    try testing.expectEqual(@as(u32, 0o120000), mode & 0o170000);
+
+    // READLINK returns the recorded target.
+    const rn = t.fs.dispatch(mkReq(&in, FUSE_READLINK, 4, sh_id, ""), &out);
+    try testing.expectEqualStrings("/bin/busybox", out[16..rn]);
 }
 
 test "virtio-fs: CREATE + WRITE + READ back" {

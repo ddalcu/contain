@@ -293,7 +293,7 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         }
-        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null);
+        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null, null);
     } else if (std.mem.eql(u8, cmd, "mkinitramfs")) {
         if (args.len < 4) {
             usage();
@@ -544,7 +544,7 @@ fn runMachineTimed(io: std.Io, kind: accel.Kind, m: *Machine) f64 {
 }
 
 /// Boot an x86-64 `vmlinux` on the x86-microvm platform via a hardware backend.
-fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize) !void {
+fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, rootfs_share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize) !void {
     // x86-microvm only runs on a hardware backend: WHP on Windows, KVM elsewhere.
     // An explicit CONTAIN_ACCEL=kvm|whp overrides the host default.
     const host_default: accel.Kind = if (builtin.os.tag == .windows) .whp else .kvm;
@@ -561,7 +561,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     var rng_seed: [64]u8 = undefined;
     if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
 
-    var m = try Machine.initX86(gpa, io, ram_size, share, true, rng_seed[0..32].*, kind == .whp);
+    var m = try Machine.initX86(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*, kind == .whp);
     defer m.deinit();
     m.input = input;
 
@@ -585,7 +585,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     std.process.exit(0);
 }
 
-fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8) !void {
+fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8, rootfs_share: ?[]const u8) !void {
     // Auto-fetch the guest kernel when the canonical default is missing (arm64
     // only — x86 builds it from source). Scoped to the default path so a custom
     // `boot <kernel>` never gets silently overwritten with the Kata kernel.
@@ -653,7 +653,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     // An ELF kernel image means a `vmlinux` -> the x86-microvm platform (PVH boot,
     // in-kernel irqchip, 16550 console). Only the hardware backends can run it.
     if (image.len >= 4 and std.mem.eql(u8, image[0..4], "\x7fELF")) {
-        try bootX86(gpa, io, image, initrd, input, disk, share, ports_spec, accel_override, interactive, ram_size);
+        try bootX86(gpa, io, image, initrd, input, disk, share, rootfs_share, ports_spec, accel_override, interactive, ram_size);
         return;
     }
 
@@ -672,7 +672,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     const rng_seed = seedRng();
     const have_seed = builtin.os.tag == .macos;
 
-    var m = try Machine.init(gpa, io, ram_size, share, true, rng_seed[0..32].*); // networking on
+    var m = try Machine.init(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*); // networking on
     defer m.deinit();
 
     const dtb = try fdt.buildVirtDtb(gpa, .{
@@ -760,6 +760,10 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\mount -t proc proc /proc 2>/dev/null
         \\mount -t sysfs sysfs /sys 2>/dev/null
         \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
+        \\# Reattach PID 1's stdio to the console. In rootfs-over-virtiofs mode the
+        \\# image's /dev has no console at exec time (unlike the kernel's initramfs),
+        \\# so without this every command's output would be lost.
+        \\exec </dev/console >/dev/console 2>&1
         \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
         \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
         \\ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null
@@ -981,26 +985,55 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
         std.debug.print("[oci] cached image at {s}\n", .{entry});
     }
 
-    // Pack the rootfs + generated /init into one initramfs cpio.
+    const init_script = try buildOciInit(arena, cfg, opts);
+    const kernel = kernel_fetch.defaultKernelPath();
+    const input: []const u8 = if (opts.interactive) "tty" else "-";
+
+    // Two ways to give the guest its root filesystem:
+    //
+    //  (a) rootfs-over-virtiofs (DEFAULT on x86): mount `rootfs_dir` as the guest's
+    //      real root over virtio-fs and demand-page it. The whole image never has to
+    //      be resident in guest RAM — a huge memory win over packing it into an
+    //      in-RAM initramfs. The generated init is written into the rootfs as
+    //      `/.contain-init` (the kernel's `init=`). No cpio, no read-back.
+    //
+    //  (b) legacy initramfs pack (arm64, or CONTAIN_ROOTFS=initramfs): pack the
+    //      rootfs + `/init` into one cpio and boot it as the initramfs root. Used
+    //      until the arm64 FUSE guest kernel ships (its release kernel has no
+    //      CONFIG_VIRTIO_FS), and as an escape hatch on x86.
+    if (useVirtiofsRoot()) {
+        const init_path = try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir});
+        try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
+        std.debug.print("[contain] rootfs-over-virtiofs: booting '{s}' (demand-paged root, no initramfs)\n", .{opts.image});
+        try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, null, rootfs_dir);
+        return;
+    }
+
+    // Legacy: pack the rootfs + generated /init into one initramfs cpio.
     std.debug.print("[contain] packing rootfs into initramfs...\n", .{});
     var cw = cpio.Writer.init(gpa);
     defer cw.deinit();
     var root = try std.Io.Dir.cwd().openDir(io, rootfs_dir, .{ .iterate = true });
     defer root.close(io);
     try rootfs.packDir(io, &cw, gpa, root);
-    const init_script = try buildOciInit(arena, cfg, opts);
     try cw.addFile("init", cpio.MODE_FILE, init_script);
     try cw.finish();
     std.debug.print("[contain] initramfs {d} bytes; booting OCI image '{s}'\n", .{ cw.bytes().len, opts.image });
+    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes(), null);
+}
 
-    // Reuse the full boot path with the host-arch kernel + the rootfs-as-initramfs
-    // (no 9p share). The packed cpio is handed to cmdBoot in memory (initrd_override)
-    // — no temp file, no read-back, no 1 GB read cap; guest RAM is auto-sized to it.
-    // x86 hosts boot the custom PVH kernel (-> KVM/WHP); arm64 the Kata Image
-    // (-> HVF/KVM). The ELF magic of vmlinux-contain selects x86-microvm.
-    const kernel = kernel_fetch.defaultKernelPath();
-    const input: []const u8 = if (opts.interactive) "tty" else "-";
-    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes());
+/// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
+/// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
+/// (ships a FUSE guest kernel); arm64 falls back until its FUSE kernel is released.
+/// CONTAIN_ROOTFS=initramfs forces the legacy pack; =virtiofs forces the new path.
+fn useVirtiofsRoot() bool {
+    if (builtin.os.tag != .windows) {
+        if (std.posix.getenv("CONTAIN_ROOTFS")) |v| {
+            if (std.mem.eql(u8, v, "initramfs")) return false;
+            if (std.mem.eql(u8, v, "virtiofs")) return true;
+        }
+    }
+    return builtin.cpu.arch == .x86_64;
 }
 
 /// Derive a default rootfs dir from an image ref: the name after the last '/',

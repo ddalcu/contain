@@ -412,7 +412,7 @@ test "machine: requestStop sets the flag and fires the registered accel kick" {
     // No networking (avoids NAT threads) and a tiny RAM window: this exercises the
     // pure stop/kick wiring without a hypervisor. io is unused with no share/net.
     const alloc = std.testing.allocator;
-    const m = try Machine.init(alloc, undefined, 64 * 1024, null, false, [_]u8{0} ** 32);
+    const m = try Machine.init(alloc, undefined, 64 * 1024, null, null, false, [_]u8{0} ** 32);
     defer m.deinit();
     try std.testing.expect(!m.stop_requested.load(.acquire));
 
