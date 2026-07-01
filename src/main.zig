@@ -9,6 +9,7 @@ const accel = @import("accel/accel.zig");
 const fdt = @import("fdt.zig");
 const cpio = @import("cpio.zig");
 const registry = @import("oci/registry.zig");
+const rootfs = @import("rootfs.zig");
 const kernel_fetch = @import("kernel_fetch.zig");
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
 const Uart16550 = @import("devices/uart_16550.zig").Uart16550;
@@ -79,7 +80,11 @@ fn restoreTerminal() void {
     }
 }
 
-const StdinCtx = struct { uart: *Pl011, io: std.Io, stop: *std.atomic.Value(bool) };
+const StdinCtx = struct { uart: *Pl011, io: std.Io, stop: *std.atomic.Value(bool), m: *Machine };
+
+// Consecutive Ctrl-C presses that force-quit the VM (a single Ctrl-C is still
+// forwarded to the guest, so guest programs can be interrupted normally).
+const force_quit_ctrlc = 3;
 
 /// Background thread: read host stdin and push each byte into the guest UART.
 /// Cursor-position reports (CSI `ESC [ ... R`) that the *host* terminal emits in
@@ -93,6 +98,7 @@ fn stdinReader(ctx: *StdinCtx) void {
     var r = sin.reader(ctx.io, &rbuf);
     var seq: [24]u8 = undefined;
     var seq_len: usize = 0; // >0 while buffering a possible escape sequence
+    var ctrlc: u8 = 0; // consecutive Ctrl-C count (force-quit escape hatch)
     const flush = struct {
         fn f(u: *Pl011, s: []const u8) void {
             for (s) |c| u.pushRx(c);
@@ -103,6 +109,16 @@ fn stdinReader(ctx: *StdinCtx) void {
         if (ctx.stop.load(.acquire)) break;
 
         if (seq_len == 0) {
+            if (b == 0x03) { // Ctrl-C: forward to the guest; N in a row force-quit
+                ctx.uart.pushRx(b);
+                ctrlc += 1;
+                if (ctrlc >= force_quit_ctrlc) {
+                    ctx.m.requestStop();
+                    break;
+                }
+                continue;
+            }
+            ctrlc = 0;
             if (b == 0x1b) {
                 seq[0] = b;
                 seq_len = 1;
@@ -187,7 +203,73 @@ const default_init =
 // 2 GB. Guest RAM is demand-zeroed (OS-backed), so idle RSS still tracks only
 // touched pages — this just raises the ceiling so larger OCI images (whose rootfs
 // rides in the initramfs) have headroom for the tmpfs copy + the workload.
-const default_ram: usize = 2 * 1024 * 1024 * 1024;
+pub const default_ram: usize = 2 * 1024 * 1024 * 1024;
+
+// Ceiling on a directly-`boot`ed initramfs file read. Auto-sized guest RAM (see
+// ramForInitrd) lets a multi-GB rootfs ride in the initramfs, so the read cap has
+// to clear that; the OCI `run` path skips the file entirely (boots from memory).
+const max_initrd_bytes: usize = 8 * 1024 * 1024 * 1024;
+
+/// Guest RAM for a boot whose rootfs rides in an `initrd_len`-byte initramfs. The
+/// kernel unpacks the cpio into a ramfs root, so mid-unpack BOTH are resident: the
+/// initrd image (reserved until unpack finishes) AND the extracted tree. The extract
+/// is bigger than the cpio — ramfs rounds every file up to a page, so a file-heavy
+/// image (many small files: node_modules, site-packages) inflates well past its
+/// packed size. Budget ~3× the initrd for that peak plus 1 GB of workload headroom,
+/// rounded up to 2 MB, floored at the 2 GB default. (Guest RAM is demand-zeroed, so
+/// over-provisioning costs host RSS only for pages actually touched.) `-m`/CONTAIN_MEM
+/// override when this heuristic is off for a given image.
+pub fn ramForInitrd(initrd_len: usize) usize {
+    const headroom: usize = 1024 * 1024 * 1024; // 1 GB for the workload after unpack
+    const needed = (initrd_len *| 3) +| headroom;
+    const two_mb: usize = 2 * 1024 * 1024;
+    const rounded = (needed +| (two_mb - 1)) / two_mb * two_mb;
+    return @max(default_ram, rounded);
+}
+
+/// Resolve the on-disk cache base: `CONTAIN_CACHE`, else `$XDG_CACHE_HOME/contain`,
+/// else `$HOME/.cache/contain` (`$USERPROFILE\.contain-cache` on Windows), else a
+/// `oci-cache` dir in the cwd. Allocated from `arena` (or a static fallback).
+fn resolveCacheDir(arena: std.mem.Allocator, env: anytype) []const u8 {
+    if (env.get("CONTAIN_CACHE")) |c| if (c.len != 0) return c;
+    if (env.get("XDG_CACHE_HOME")) |x| if (x.len != 0) return std.fmt.allocPrint(arena, "{s}/contain", .{x}) catch "oci-cache";
+    if (env.get("HOME")) |h| if (h.len != 0) return std.fmt.allocPrint(arena, "{s}/.cache/contain", .{h}) catch "oci-cache";
+    if (env.get("USERPROFILE")) |u| if (u.len != 0) return std.fmt.allocPrint(arena, "{s}/.contain-cache", .{u}) catch "oci-cache";
+    return "oci-cache";
+}
+
+/// True if `path` exists (best-effort; any access error reads as "absent").
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Parse a docker-style `--pull` value. Returns null for anything else (so a bare
+/// `--pull` followed by the image name is treated as `.always`, not consumed).
+pub fn parsePullPolicy(s: []const u8) ?PullPolicy {
+    if (std.mem.eql(u8, s, "always")) return .always;
+    if (std.mem.eql(u8, s, "missing")) return .missing;
+    if (std.mem.eql(u8, s, "never")) return .never;
+    return null;
+}
+
+/// Parse a docker-style memory size: a plain byte count, or a number with a K/M/G
+/// suffix (powers of 1024, case-insensitive). Returns null on anything malformed
+/// (empty, non-numeric, fractional) so the caller can report a usage error.
+pub fn parseMemSize(s: []const u8) ?usize {
+    if (s.len == 0) return null;
+    var end = s.len;
+    var mult: usize = 1;
+    switch (s[s.len - 1]) {
+        'g', 'G' => mult = 1024 * 1024 * 1024,
+        'm', 'M' => mult = 1024 * 1024,
+        'k', 'K' => mult = 1024,
+        else => {},
+    }
+    if (mult != 1) end -= 1;
+    const n = std.fmt.parseInt(usize, s[0..end], 10) catch return null;
+    return n *| mult;
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -201,6 +283,8 @@ pub fn main(init: std.process.Init) !void {
 
     // CONTAIN_ACCEL selects the vCPU backend (hvf|kvm|whp); unset = host default.
     const accel_override = init.environ_map.get("CONTAIN_ACCEL");
+    // CONTAIN_MEM overrides the auto-sized guest RAM (e.g. "4G"); `run -m` beats it.
+    const mem_override = init.environ_map.get("CONTAIN_MEM");
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "boot")) {
@@ -208,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         }
-        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override);
+        try cmdBoot(gpa, io, args[2], if (args.len > 3) args[3] else null, if (args.len > 4) args[4] else null, if (args.len > 5) args[5] else null, if (args.len > 6) args[6] else null, if (args.len > 7) args[7] else null, accel_override, mem_override, null);
     } else if (std.mem.eql(u8, cmd, "mkinitramfs")) {
         if (args.len < 4) {
             usage();
@@ -232,11 +316,12 @@ pub fn main(init: std.process.Init) !void {
             usage();
             return;
         }
-        const opts = (try parseRunArgs(init.arena.allocator(), args[2..], accel_override)) orelse {
+        const opts = (try parseRunArgs(init.arena.allocator(), args[2..], accel_override, mem_override)) orelse {
             usage();
             return;
         };
-        try cmdRunOci(gpa, io, opts);
+        const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
+        try cmdRunOci(gpa, io, opts, cache_base);
     } else {
         usage();
     }
@@ -330,6 +415,10 @@ fn usage() void {
         \\    -v, --volume  host:/path            mount a host dir in the guest (9p)
         \\    -e, --env     KEY=VALUE             set an env var (repeatable)
         \\    -w, --workdir DIR                   working dir for the command
+        \\    -m, --memory  SIZE                  guest RAM (e.g. 4G, 512M); default
+        \\                                        auto-sized to the image
+        \\    --pull        always|missing|never  refetch policy (default: missing =
+        \\                                        reuse the cached image if present)
         \\    --entrypoint  CMD                   override the image entrypoint
         \\    --rm, --name, -u/--user             accepted for docker-compat (ignored)
         \\    -d, --detach                        unsupported (runs in foreground)
@@ -345,6 +434,9 @@ fn usage() void {
         \\         or "-" to skip. ports / -p: host->guest TCP forwards, e.g.
         \\         "8080" or "8080:3000" or "8080,5173:5173" (use "-" to skip).
         \\  CONTAIN_ACCEL=hvf|kvm|whp overrides the auto-selected backend.
+        \\  CONTAIN_MEM=4G overrides the auto-sized guest RAM (run -m wins over it).
+        \\  CONTAIN_CACHE=<dir> sets the image cache (default ~/.cache/contain); a
+        \\  cached image runs offline with no re-download or re-unpack.
         \\
     , .{});
 }
@@ -367,17 +459,25 @@ fn setupForwards(m: *Machine, spec: []const u8) void {
     }
 }
 
-const X86StdinCtx = struct { uart: *Uart16550, io: std.Io, stop: *std.atomic.Value(bool) };
+const X86StdinCtx = struct { uart: *Uart16550, io: std.Io, stop: *std.atomic.Value(bool), m: *Machine };
 
 /// Background thread: feed host stdin into the guest's 16550 (x86 console).
 fn x86StdinReader(ctx: *X86StdinCtx) void {
     var sin = std.Io.File.stdin();
     var rbuf: [64]u8 = undefined;
     var r = sin.reader(ctx.io, &rbuf);
+    var ctrlc: u8 = 0;
     while (!ctx.stop.load(.acquire)) {
         const b = r.interface.takeByte() catch break;
         if (ctx.stop.load(.acquire)) break;
         ctx.uart.pushRx(b);
+        if (b == 0x03) { // Ctrl-C: N consecutive presses force-quit the VM
+            ctrlc += 1;
+            if (ctrlc >= force_quit_ctrlc) {
+                ctx.m.requestStop();
+                break;
+            }
+        } else ctrlc = 0;
     }
 }
 
@@ -419,6 +519,7 @@ fn writebackDisk(io: std.Io, m: *Machine, disk: ?[]const u8) void {
 /// (it lives in the caller's frame, which never unwinds before process exit).
 fn startStdinReader(readerFn: anytype, ctx: anytype) void {
     enterRawTerminal();
+    std.debug.print("[contain] interactive: press Ctrl-C {d}x to force-quit the VM\n", .{force_quit_ctrlc});
     if (std.Thread.spawn(.{}, readerFn, .{ctx})) |t| t.detach() else |_| {
         std.debug.print("[contain] warn: interactive input unavailable (thread spawn failed)\n", .{});
     }
@@ -442,7 +543,7 @@ fn runMachineTimed(io: std.Io, kind: accel.Kind, m: *Machine) f64 {
 }
 
 /// Boot an x86-64 `vmlinux` on the x86-microvm platform via a hardware backend.
-fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool) !void {
+fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]const u8, input: []const u8, disk: ?[]const u8, share: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, interactive: bool, ram_size: usize) !void {
     // x86-microvm only runs on a hardware backend: WHP on Windows, KVM elsewhere.
     // An explicit CONTAIN_ACCEL=kvm|whp overrides the host default.
     const host_default: accel.Kind = if (builtin.os.tag == .windows) .whp else .kvm;
@@ -459,11 +560,11 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     var rng_seed: [64]u8 = undefined;
     if (builtin.os.tag == .macos) std.c.arc4random_buf(&rng_seed, rng_seed.len) else @memset(&rng_seed, 0);
 
-    var m = try Machine.initX86(gpa, io, default_ram, share, true, rng_seed[0..32].*, kind == .whp);
+    var m = try Machine.initX86(gpa, io, ram_size, share, true, rng_seed[0..32].*, kind == .whp);
     defer m.deinit();
     m.input = input;
 
-    std.debug.print("[contain] platform=x86-microvm accel={s}\n[contain] cmdline: {s}\n", .{ @tagName(kind), m.x86_cmdline.? });
+    std.debug.print("[contain] platform=x86-microvm accel={s}, guest RAM {d} MB\n[contain] cmdline: {s}\n", .{ @tagName(kind), ram_size / (1024 * 1024), m.x86_cmdline.? });
     try m.bootPvh(vmlinux, initrd);
     std.debug.print("[contain] vmlinux={d} bytes, initrd={?d} bytes, PVH entry=0x{x}, start_info=0x{x}, virtio devs={d}\n", .{ vmlinux.len, if (initrd) |ir| ir.len else null, m.x86_entry, m.x86_start_info, m.num_virtio });
 
@@ -471,7 +572,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     if (ports_spec) |ps| if (!isNone(ps)) setupForwards(m, ps);
 
     var stop = std.atomic.Value(bool).init(false);
-    var stdin_ctx: X86StdinCtx = .{ .uart = m.uart16550.?, .io = io, .stop = &stop };
+    var stdin_ctx: X86StdinCtx = .{ .uart = m.uart16550.?, .io = io, .stop = &stop, .m = m };
     if (interactive) startStdinReader(x86StdinReader, &stdin_ctx);
 
     const secs = runMachineTimed(io, kind, m);
@@ -483,7 +584,7 @@ fn bootX86(gpa: std.mem.Allocator, io: std.Io, vmlinux: []const u8, initrd: ?[]c
     std.process.exit(0);
 }
 
-fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8) !void {
+fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_path: ?[]const u8, input_path: ?[]const u8, disk_path: ?[]const u8, share_path: ?[]const u8, ports_spec: ?[]const u8, accel_override: ?[]const u8, mem_override: ?[]const u8, initrd_override: ?[]const u8) !void {
     // Auto-fetch the guest kernel when the canonical default is missing (arm64
     // only — x86 builds it from source). Scoped to the default path so a custom
     // `boot <kernel>` never gets silently overwritten with the Kata kernel.
@@ -513,14 +614,32 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     };
     defer gpa.free(input);
 
-    const initrd: ?[]u8 = if (initrd_path) |p|
-        std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(256 * 1024 * 1024)) catch |err| {
+    // The OCI `run` path already holds the packed cpio in memory and passes it via
+    // initrd_override — boot straight from it (no temp file, no read-back). Otherwise
+    // read the `boot <initrd>` file. A full distro rootfs rides in the initramfs, so
+    // the cap is generous (up to max_initrd_bytes); guest RAM is auto-sized to fit.
+    var owned_initrd: ?[]u8 = null;
+    defer if (owned_initrd) |ir| gpa.free(ir);
+    const initrd: ?[]const u8 = if (initrd_override) |ov|
+        ov
+    else if (initrd_path) |p| blk: {
+        const buf = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(max_initrd_bytes)) catch |err| {
             std.debug.print("contain: cannot read initramfs '{s}': {s}\n", .{ p, @errorName(err) });
+            return;
+        };
+        owned_initrd = buf;
+        break :blk buf;
+    } else null;
+
+    // Auto-size guest RAM to the unpack peak (see ramForInitrd); an explicit
+    // -m/--memory or CONTAIN_MEM overrides it.
+    const ram_size: usize = if (mem_override) |ms|
+        parseMemSize(ms) orelse {
+            std.debug.print("contain: invalid memory size '{s}' (use e.g. 4G, 512M, or a byte count)\n", .{ms});
             return;
         }
     else
-        null;
-    defer if (initrd) |ir| gpa.free(ir);
+        ramForInitrd(if (initrd) |ir| ir.len else 0);
 
     const initrd_start = machine_mod.initrd_load;
     const initrd_end = if (initrd) |ir| initrd_start + ir.len else null;
@@ -533,7 +652,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     // An ELF kernel image means a `vmlinux` -> the x86-microvm platform (PVH boot,
     // in-kernel irqchip, 16550 console). Only the hardware backends can run it.
     if (image.len >= 4 and std.mem.eql(u8, image[0..4], "\x7fELF")) {
-        try bootX86(gpa, io, image, initrd, input, disk, share, ports_spec, accel_override, interactive);
+        try bootX86(gpa, io, image, initrd, input, disk, share, ports_spec, accel_override, interactive, ram_size);
         return;
     }
 
@@ -545,26 +664,29 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
         std.debug.print("[contain] accel {s} unavailable on this host ({s}/{s}); an arm64 Linux guest needs HVF (Apple Silicon) or KVM (arm64 Linux).\n", .{ @tagName(accel_kind), @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
         return;
     }
-    std.debug.print("[contain] accel backend: {s}\n", .{@tagName(accel_kind)});
+    std.debug.print("[contain] accel backend: {s}, guest RAM {d} MB\n", .{ @tagName(accel_kind), ram_size / (1024 * 1024) });
 
     // Host entropy: seeds both the virtio-rng device (guest CRNG) and the DTB
     // /chosen/rng-seed. Without it the guest stalls seconds on getrandom().
     const rng_seed = seedRng();
     const have_seed = builtin.os.tag == .macos;
 
-    var m = try Machine.init(gpa, io, default_ram, share, true, rng_seed[0..32].*); // networking on
+    var m = try Machine.init(gpa, io, ram_size, share, true, rng_seed[0..32].*); // networking on
     defer m.deinit();
 
     const dtb = try fdt.buildVirtDtb(gpa, .{
         .ram_base = machine_mod.ram_base,
-        .ram_size = default_ram,
+        .ram_size = ram_size,
         .rng_seed = if (have_seed) &rng_seed else null,
         // CRNG seeding is handled by the virtio-rng device (the DT rng-seed below
         // is also credited on kernels built with CONFIG_RANDOM_TRUST_BOOTLOADER).
+        // panic=-1: on any kernel panic (e.g. an image with no /bin/sh, so /init
+        // can't exec) reboot immediately -> PSCI SYSTEM_RESET -> the run loop exits
+        // cleanly instead of the vCPU spinning forever with no way out.
         .bootargs = if (interactive)
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive"
+            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive panic=-1"
         else
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init",
+            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1",
         .initrd_start = if (initrd != null) initrd_start else null,
         .initrd_end = initrd_end,
         .num_virtio = m.num_virtio,
@@ -587,7 +709,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
 
     // Interactive: attach the host terminal to the guest console.
     var stop = std.atomic.Value(bool).init(false);
-    var stdin_ctx: StdinCtx = .{ .uart = m.uart, .io = io, .stop = &stop };
+    var stdin_ctx: StdinCtx = .{ .uart = m.uart, .io = io, .stop = &stop, .m = m };
     if (interactive) startStdinReader(stdinReader, &stdin_ctx);
 
     const secs = runMachineTimed(io, accel_kind, m);
@@ -637,9 +759,10 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
         \\mount -t proc proc /proc 2>/dev/null
         \\mount -t sysfs sysfs /sys 2>/dev/null
         \\mount -t devtmpfs devtmpfs /dev 2>/dev/null
-        \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
-        \\ip link set eth0 up 2>/dev/null
-        \\ip route add default via 10.0.2.2 2>/dev/null
+        \\ip addr add 127.0.0.1/8 dev lo 2>/dev/null; ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+        \\ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+        \\ip link set eth0 up 2>/dev/null || ifconfig eth0 up 2>/dev/null
+        \\ip route add default via 10.0.2.2 2>/dev/null || route add default gw 10.0.2.2 2>/dev/null
         \\echo "nameserver 10.0.2.3" > /etc/resolv.conf 2>/dev/null
         \\
     );
@@ -654,7 +777,8 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
     if (workdir) |d| try w.print("cd {s} 2>/dev/null\n", .{d});
     // Interactive with no command and no entrypoint override: drop into a shell.
     if (opts.interactive and opts.command.len == 0 and opts.entrypoint == null) {
-        try w.writeAll("setsid -c /bin/sh\nsync; poweroff -f\n");
+        try w.writeAll("setsid -c /bin/sh\n");
+        try w.writeAll(rootfs.poweroff_seq);
         return aw.written();
     }
     try w.writeAll("echo \"=== contain: running OCI image ===\"\n");
@@ -669,69 +793,9 @@ fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOp
     }
     const args = if (opts.command.len != 0) opts.command else (if (opts.entrypoint != null) &[_][]const u8{} else cfg.cmd);
     for (args) |a| try shellQuote(w, a);
-    try w.writeAll("\necho \"=== contain: entrypoint exited, powering off ===\"\nsync; poweroff -f\n");
+    try w.writeAll("\necho \"=== contain: entrypoint exited, powering off ===\"\n");
+    try w.writeAll(rootfs.poweroff_seq);
     return aw.written();
-}
-
-/// Recursively pack a host directory tree into the cpio (rootfs -> initramfs).
-/// Modes are set executable for all files (over-permissive but functional);
-/// symlinks and the directory layout are preserved. Device nodes are skipped
-/// (devtmpfs provides /dev).
-fn packRootfs(io: std.Io, cw: *cpio.Writer, gpa: std.mem.Allocator, root: std.Io.Dir) !void {
-    // Windows can't create on-disk symlinks, so the OCI unpack recorded them in a
-    // `.contain-symlinks` sidecar (path\ttarget) and left an empty placeholder file
-    // at each path. Load it so we can (a) skip those placeholders during the walk
-    // and (b) emit real symlinks into the cpio (which supports them).
-    var links: std.StringHashMapUnmanaged([]const u8) = .empty;
-    defer links.deinit(gpa);
-    const sidecar: []const u8 = if (builtin.os.tag == .windows)
-        (root.readFileAlloc(io, ".contain-symlinks", gpa, .limited(8 * 1024 * 1024)) catch &[_]u8{})
-    else
-        &[_]u8{};
-    defer if (sidecar.len != 0) gpa.free(sidecar);
-    {
-        var it = std.mem.tokenizeScalar(u8, sidecar, '\n');
-        while (it.next()) |line| {
-            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
-            try links.put(gpa, line[0..tab], line[tab + 1 ..]);
-        }
-    }
-
-    var walker = try root.walk(gpa);
-    defer walker.deinit();
-    var lbuf: [4096]u8 = undefined;
-    var pbuf: [4096]u8 = undefined;
-    while (try walker.next(io)) |entry| {
-        // Normalize to forward slashes (the cpio + guest use '/'); the Windows
-        // walker yields backslash paths.
-        const p = normPath(&pbuf, entry.path);
-        if (std.mem.eql(u8, p, ".contain-symlinks")) continue;
-        if (links.contains(p)) continue; // a symlink placeholder, emitted below
-        switch (entry.kind) {
-            .directory => cw.addDir(p) catch {},
-            .sym_link => {
-                const n = root.readLink(io, entry.path, &lbuf) catch continue;
-                cw.addSymlink(p, lbuf[0..n]) catch {};
-            },
-            .file => {
-                const data = root.readFileAlloc(io, entry.path, gpa, .limited(512 * 1024 * 1024)) catch continue;
-                defer gpa.free(data);
-                cw.addFile(p, cpio.MODE_FILE, data) catch {};
-            },
-            else => {}, // device/fifo/socket: skipped
-        }
-    }
-
-    var lit = links.iterator();
-    while (lit.next()) |e| cw.addSymlink(e.key_ptr.*, e.value_ptr.*) catch {};
-}
-
-/// Copy `path` into `buf` with backslashes turned into forward slashes.
-fn normPath(buf: []u8, path: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, path, '\\') == null) return path;
-    const n = @min(buf.len, path.len);
-    for (path[0..n], 0..) |c, i| buf[i] = if (c == '\\') '/' else c;
-    return buf[0..n];
 }
 
 /// The parsed surface of `contain run` — mirrors `docker run`.
@@ -746,7 +810,15 @@ pub const RunOpts = struct {
     entrypoint: ?[]const u8 = null, // --entrypoint (overrides the image entrypoint)
     interactive: bool = false, // -i/-t/-it/--interactive/--tty
     accel_override: ?[]const u8 = null,
+    mem: ?[]const u8 = null, // -m/--memory (docker-style size, e.g. "4G"); else CONTAIN_MEM
+    pull_policy: PullPolicy = .missing, // --pull [always|missing|never]
 };
+
+/// When to (re)pull an image vs. reuse the on-disk cache. `.missing` (the default)
+/// reuses a cached image and only hits the network on a cache miss — a moved tag
+/// is not noticed until `--pull always` or the cache is cleared. `.never` requires
+/// a cached image (fully offline). `.always` forces a fresh pull.
+pub const PullPolicy = enum { missing, always, never };
 
 /// Split a `-v host:container[:ro]` spec. A bare `host` (no colon) mounts at
 /// /mnt (lenient). NOTE: splits on the first colon, so a Windows `C:\...` host
@@ -782,8 +854,8 @@ fn shortBoolFlags(a: []const u8) ?struct { interactive: bool, detach: bool } {
 /// the image is the command verbatim (no `--` needed, though a leading `--` is
 /// tolerated). Returns null (caller prints usage) if no image is given or an
 /// unsupported flag is hit.
-pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_override: ?[]const u8) !?RunOpts {
-    var opts: RunOpts = .{ .image = "", .accel_override = accel_override };
+pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_override: ?[]const u8, mem_env: ?[]const u8) !?RunOpts {
+    var opts: RunOpts = .{ .image = "", .accel_override = accel_override, .mem = mem_env };
     var ports: std.ArrayListUnmanaged([]const u8) = .empty;
     var env: std.ArrayListUnmanaged([]const u8) = .empty;
     var nvol: u32 = 0;
@@ -810,6 +882,15 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
             }
         } else if (eq(u8, a, "-e") or eq(u8, a, "--env")) {
             if (next(args, &i)) |v| try env.append(arena, v);
+        } else if (eq(u8, a, "-m") or eq(u8, a, "--memory")) {
+            if (next(args, &i)) |v| opts.mem = v; // overrides the CONTAIN_MEM fallback
+        } else if (eq(u8, a, "--pull")) {
+            // docker-style: --pull always|missing|never. A bare --pull means always.
+            const val: ?PullPolicy = if (i + 1 < args.len) parsePullPolicy(args[i + 1]) else null;
+            if (val) |p| {
+                opts.pull_policy = p;
+                i += 1;
+            } else opts.pull_policy = .always;
         } else if (eq(u8, a, "-w") or eq(u8, a, "--workdir")) {
             opts.workdir = next(args, &i);
         } else if (eq(u8, a, "--entrypoint")) {
@@ -850,38 +931,75 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
 /// the guest. The unpacked rootfs is packed straight into the initramfs (rootfs
 /// as root), so the image's own shell/loader/binaries run directly. The host-arch
 /// kernel is chosen automatically (x86 -> vmlinux-contain, arm64 -> Image-arm64).
-fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts) !void {
-    const rootfs = "oci-rootfs";
+///
+/// The image is cached under `cache_base` keyed by ref+arch: an unpacked `rootfs/`,
+/// its `config.json`, and a `.complete` marker written only after a full pull. A
+/// later run of the same ref reuses the cache with no network and no re-unpack
+/// (`--pull always` forces a refresh; `--pull never` requires the cache). Layer/
+/// config blobs are also cached by digest under `<cache_base>/blobs`.
+fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []const u8) !void {
     var tio = std.Io.Threaded.init(gpa, .{});
     defer tio.deinit();
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    const cfg = registry.pull(gpa, arena, tio.io(), opts.image, rootfs, registry.Arch.hostDefault()) catch |err| {
-        std.debug.print("contain: pull failed: {s}\n", .{@errorName(err)});
+    const arch = registry.Arch.hostDefault();
+    const entry = try registry.cacheEntryPath(arena, cache_base, opts.image, arch);
+    const rootfs_dir = try std.fmt.allocPrint(arena, "{s}/rootfs", .{entry});
+    const cfg_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{entry});
+    const complete = try std.fmt.allocPrint(arena, "{s}/.complete", .{entry});
+    const blobs_dir = try std.fmt.allocPrint(arena, "{s}/blobs", .{cache_base});
+    const cwd = std.Io.Dir.cwd();
+
+    // A cache hit needs the `.complete` marker (only written after a full pull), so
+    // a crashed/partial unpack is never mistaken for a usable image.
+    const cached = opts.pull_policy != .always and pathExists(io, complete);
+    var cfg: registry.ImageConfig = undefined;
+    if (cached) {
+        cfg = registry.parseConfigFile(arena, gpa, io, cfg_path) catch |err| {
+            std.debug.print("contain: cached image config unreadable ({s}); refetch with `--pull always`\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("[oci] using cached image '{s}' ({s})\n", .{ opts.image, entry });
+    } else if (opts.pull_policy == .never) {
+        std.debug.print("contain: image '{s}' not cached and `--pull never`; run it once online first\n", .{opts.image});
         return;
-    };
+    } else {
+        // Fresh pull: drop any stale/partial entry so two images never merge.
+        cwd.deleteTree(io, entry) catch {};
+        cwd.createDirPath(io, rootfs_dir) catch {};
+        cfg = registry.pull(gpa, arena, tio.io(), opts.image, rootfs_dir, arch, .{
+            .cache_dir = blobs_dir,
+            .config_out = cfg_path,
+        }) catch |err| {
+            std.debug.print("contain: pull failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        cwd.writeFile(io, .{ .sub_path = complete, .data = "" }) catch {};
+        std.debug.print("[oci] cached image at {s}\n", .{entry});
+    }
 
     // Pack the rootfs + generated /init into one initramfs cpio.
     std.debug.print("[contain] packing rootfs into initramfs...\n", .{});
     var cw = cpio.Writer.init(gpa);
     defer cw.deinit();
-    var root = try std.Io.Dir.cwd().openDir(io, rootfs, .{ .iterate = true });
+    var root = try std.Io.Dir.cwd().openDir(io, rootfs_dir, .{ .iterate = true });
     defer root.close(io);
-    try packRootfs(io, &cw, gpa, root);
+    try rootfs.packDir(io, &cw, gpa, root);
     const init_script = try buildOciInit(arena, cfg, opts);
     try cw.addFile("init", cpio.MODE_FILE, init_script);
     try cw.finish();
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "oci-initramfs.cpio", .data = cw.bytes() });
     std.debug.print("[contain] initramfs {d} bytes; booting OCI image '{s}'\n", .{ cw.bytes().len, opts.image });
 
     // Reuse the full boot path with the host-arch kernel + the rootfs-as-initramfs
-    // (no 9p share). x86 hosts boot the custom PVH kernel (-> KVM/WHP); arm64 the
-    // Kata Image (-> HVF/KVM). The ELF magic of vmlinux-contain selects x86-microvm.
+    // (no 9p share). The packed cpio is handed to cmdBoot in memory (initrd_override)
+    // — no temp file, no read-back, no 1 GB read cap; guest RAM is auto-sized to it.
+    // x86 hosts boot the custom PVH kernel (-> KVM/WHP); arm64 the Kata Image
+    // (-> HVF/KVM). The ELF magic of vmlinux-contain selects x86-microvm.
     const kernel = kernel_fetch.defaultKernelPath();
     const input: []const u8 = if (opts.interactive) "tty" else "-";
-    try cmdBoot(gpa, io, kernel, "oci-initramfs.cpio", input, null, opts.volume_host, opts.ports, opts.accel_override);
+    try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes());
 }
 
 /// Derive a default rootfs dir from an image ref: the name after the last '/',
@@ -915,7 +1033,7 @@ fn cmdPull(gpa: std.mem.Allocator, image_ref: []const u8, dest_arg: ?[]const u8,
     const dest = dest_arg orelse try defaultRootfsDir(arena_inst.allocator(), image_ref);
     std.debug.print("[contain] unpacking '{s}' rootfs to ./{s}\n", .{ image_ref, dest });
 
-    const cfg = registry.pull(gpa, arena_inst.allocator(), pio, image_ref, dest, arch) catch |err| {
+    const cfg = registry.pull(gpa, arena_inst.allocator(), pio, image_ref, dest, arch, .{}) catch |err| {
         std.debug.print("contain: pull failed: {s}\n", .{@errorName(err)});
         return;
     };

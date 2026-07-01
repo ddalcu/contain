@@ -141,6 +141,7 @@ const Inbound = struct {
 
 const Listener = struct {
     gport: u16,
+    host_port: u16, // the published host port (used to self-connect-wake accept at teardown)
     server: net.Server,
     thread: ?std.Thread = null,
 };
@@ -193,6 +194,8 @@ pub const Nat = struct {
     listeners: std.ArrayListUnmanaged(*Listener) = .empty,
     accepts: std.ArrayListUnmanaged(AcceptEv) = .empty,
     ephem_next: u16 = 40000,
+    // Set by deinit so accept threads, once woken, exit instead of accepting.
+    closing: std.atomic.Value(bool) = .{ .raw = false },
 
     pub fn init(alloc: std.mem.Allocator, guest_mac: [6]u8) Nat {
         return .{ .alloc = alloc, .guest_mac = guest_mac, .have_guest_mac = true };
@@ -205,7 +208,7 @@ pub const Nat = struct {
         const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = host_port } };
         const server = try addr.listen(self.io, .{ .mode = .stream });
         const lst = try self.alloc.create(Listener);
-        lst.* = .{ .gport = guest_port, .server = server };
+        lst.* = .{ .gport = guest_port, .host_port = host_port, .server = server };
         try self.listeners.append(self.alloc, lst);
         lst.thread = std.Thread.spawn(.{}, acceptThread, .{ self, lst }) catch null;
     }
@@ -215,6 +218,10 @@ pub const Nat = struct {
     fn acceptThread(self: *Nat, lst: *Listener) void {
         while (true) {
             const stream = lst.server.accept(self.io) catch break;
+            if (self.closing.load(.acquire)) { // woken by deinit's self-connect
+                stream.close(self.io);
+                break;
+            }
             self.lock();
             self.accepts.append(self.alloc, .{ .gport = lst.gport, .stream = stream }) catch {
                 self.unlock();
@@ -262,8 +269,11 @@ pub const Nat = struct {
     fn closeInbound(self: *Nat, id: u32) void {
         for (self.inconns.items, 0..) |*c, i| {
             if (c.id == id) {
-                c.stream.close(self.io); // wakes its reader thread
-                if (c.thread) |t| t.detach();
+                // See closeTcp: shutdown + JOIN before close(), so the reader never
+                // does a netRead on a closed fd (which panics with BADF).
+                self.shutdownHandle(c.stream.socket.handle);
+                if (c.thread) |t| t.join();
+                c.stream.close(self.io);
                 c.tcb.sndbuf.deinit(self.alloc);
                 _ = self.inconns.swapRemove(i);
                 return;
@@ -312,6 +322,13 @@ pub const Nat = struct {
         }
     }
 
+    /// Unblock a reader thread parked in recv()/recvfrom() on `handle`. A plain
+    /// close() from another thread does NOT reliably wake a blocking recv on macOS;
+    /// shutdown() does. No-op on an already-dead socket.
+    fn shutdownHandle(self: *Nat, handle: net.Socket.Handle) void {
+        self.io.vtable.netShutdown(self.io.userdata, handle, .both) catch {};
+    }
+
     fn lock(self: *Nat) void {
         while (self.lock_flag.swap(true, .acquire)) std.atomic.spinLoopHint();
     }
@@ -320,15 +337,30 @@ pub const Nat = struct {
     }
 
     pub fn deinit(self: *Nat) void {
-        // Close sockets so blocked reader/accept threads return, then join them.
-        for (self.listeners.items) |l| l.server.deinit(self.io);
-        for (self.udp.items) |*u| u.sock.close(self.io);
-        for (self.tcp.items) |*c| c.stream.close(self.io);
-        for (self.inconns.items) |*c| c.stream.close(self.io);
-        for (self.listeners.items) |l| if (l.thread) |t| t.join();
+        // Wind down the background reader/accept threads cleanly so this returns
+        // without hanging (the library has no process.exit() to fall back on).
+        self.closing.store(true, .release);
+        // (1) Wake recv()-blocked reader threads. shutdown() is required: a plain
+        // close() from this thread does not unblock a recv() running on another.
+        for (self.udp.items) |*u| self.shutdownHandle(u.sock.handle);
+        for (self.tcp.items) |*c| self.shutdownHandle(c.stream.socket.handle);
+        for (self.inconns.items) |*c| self.shutdownHandle(c.stream.socket.handle);
+        // (2) Wake accept()-blocked listener threads. shutdown() does not wake
+        // accept() on macOS, so self-connect to each published port; the thread
+        // sees `closing` and breaks. (Servers are still open at this point.)
+        for (self.listeners.items) |l| {
+            const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = l.host_port } };
+            if (addr.connect(self.io, .{ .mode = .stream })) |waker| waker.close(self.io) else |_| {}
+        }
+        // (3) Join the now-unblocked threads, then close the sockets.
         for (self.udp.items) |*u| if (u.thread) |t| t.join();
         for (self.tcp.items) |*c| if (c.thread) |t| t.join();
         for (self.inconns.items) |*c| if (c.thread) |t| t.join();
+        for (self.listeners.items) |l| if (l.thread) |t| t.join();
+        for (self.udp.items) |*u| u.sock.close(self.io);
+        for (self.tcp.items) |*c| c.stream.close(self.io);
+        for (self.inconns.items) |*c| c.stream.close(self.io);
+        for (self.listeners.items) |l| l.server.deinit(self.io);
         for (self.accepts.items) |*a| a.stream.close(self.io);
         for (self.inbound.items) |it| if (it.data.len > 0) self.alloc.free(it.data);
         for (self.tcp.items) |*c| c.tcb.sndbuf.deinit(self.alloc);
@@ -769,8 +801,12 @@ pub const Nat = struct {
     fn closeTcp(self: *Nat, id: u32) void {
         for (self.tcp.items, 0..) |*c, i| {
             if (c.id == id) {
-                c.stream.close(self.io); // wakes the reader thread
-                if (c.thread) |t| t.detach(); // it will exit on the closed socket
+                // shutdown wakes a reader blocked in netRead; JOIN it before close()
+                // so the fd is never read after it's closed (a closed-fd netRead
+                // panics with BADF under std's Threaded IO).
+                self.shutdownHandle(c.stream.socket.handle);
+                if (c.thread) |t| t.join();
+                c.stream.close(self.io);
                 c.tcb.sndbuf.deinit(self.alloc);
                 _ = self.tcp.swapRemove(i);
                 return;

@@ -1,10 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [ main, master ]
   pull_request:
   workflow_dispatch:
+  # Pushes to main are built + released by release.yml (which also runs tests),
+  # so CI here only guards pull requests.
 
 permissions:
   contents: read

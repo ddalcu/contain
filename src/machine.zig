@@ -68,6 +68,16 @@ pub const Machine = struct {
     irq: IrqLine,
     alloc: std.mem.Allocator,
     io: std.Io,
+    /// Cooperative stop signal. The accel run loop checks this each iteration (and
+    /// during idle/WFI slices) and returns when set, so a library embedder can
+    /// power off a still-running guest. `requestStop` also kicks the vCPU out of a
+    /// blocking hypervisor run via the backend-registered `accel_kick`.
+    stop_requested: std.atomic.Value(bool) = .init(false),
+    /// The active vCPU handle + a backend "kick" that forces it to exit a blocked
+    /// run (HVF: hv_vcpus_exit). Set by the accel backend while running, cleared on
+    /// exit; null when no guest is running.
+    accel_vcpu: u64 = 0,
+    accel_kick: ?*const fn (vcpu: u64) void = null,
     /// Number of virtio devices exposed (for the DTB).
     num_virtio: u32 = 1,
     /// Optional scripted console input, fed to the UART RX one byte at a time as
@@ -92,6 +102,9 @@ pub const Machine = struct {
         self.net_io = null;
         self.num_virtio = 1;
         self.irq = .{};
+        self.stop_requested = .init(false); // alloc.create() ignores field defaults
+        self.accel_vcpu = 0;
+        self.accel_kick = null;
         self.bus = try Bus.init(alloc, ram_base, ram_size);
 
         const uart = try alloc.create(Pl011);
@@ -257,6 +270,9 @@ pub const Machine = struct {
         self.input = "";
         self.input_pos = 0;
         self.irq = .{};
+        self.stop_requested = .init(false); // alloc.create() ignores field defaults
+        self.accel_vcpu = 0;
+        self.accel_kick = null;
         self.bus = try Bus.init(alloc, x86_ram_base, ram_size);
 
         const gic = try alloc.create(Gicv2);
@@ -511,5 +527,13 @@ pub const Machine = struct {
     /// hostfwd). No-op if networking is disabled.
     pub fn addHostForward(self: *Machine, host_port: u16, guest_port: u16) !void {
         if (self.natp) |nat| try nat.addHostForward(host_port, guest_port);
+    }
+
+    /// Ask the running guest to stop. Safe to call from another thread: it sets the
+    /// cooperative flag the accel loop polls, then kicks the vCPU out of any
+    /// blocking hypervisor run so the loop notices the flag promptly.
+    pub fn requestStop(self: *Machine) void {
+        self.stop_requested.store(true, .release);
+        if (self.accel_kick) |kick| kick(self.accel_vcpu);
     }
 };

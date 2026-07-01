@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference entitlements for a sandboxed macOS app that embeds libcontain.
+
+  The hypervisor entitlement is App Sandbox compatible on macOS (UTM ships a
+  sandboxed, hypervisor-accelerated build on the Mac App Store). contain's NAT is
+  pure-userspace BSD sockets, so it needs only the network client/server
+  entitlements — NOT the privileged com.apple.vm.networking. File access outside
+  the app container needs a user-selected file picker + security-scoped bookmarks;
+  keep the kernel, disk image and 9p share inside the container to avoid it.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<key>com.apple.security.hypervisor</key>
+	<true/>
+
+	<!-- guest outbound traffic via the userspace NAT -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- host->guest TCP port forwarding (contain_config.ports); drop if unused -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+
+	<!-- mount a user-chosen host directory as the 9p share (with a file picker +
+	     security-scoped bookmark); drop if shares stay inside the container -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>

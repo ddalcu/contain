@@ -13,8 +13,10 @@ const builtin = @import("builtin");
 const http = std.http;
 const flate = std.compress.flate;
 
-// contain's kernel release. Assets live on the (public) GitHub release so the
-// download needs no auth; bump `release_tag` whenever the kernels are rebuilt.
+// contain's kernel release — a pinned, separately-published release of the guest
+// kernels (they change rarely, so they're decoupled from the per-commit binary
+// releases). Assets are public, so the download needs no auth. Bump this only
+// when you actually rebuild + republish the kernels (tools/build_kernel.sh).
 const release_base = "https://github.com/ddalcu/contain/releases/download";
 const release_tag = "kernels-v1";
 
@@ -78,10 +80,11 @@ fn download(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 
     var aw = std.Io.Writer.Allocating.init(gpa);
     errdefer aw.deinit();
+    // No extra headers: std.http.Client already sends a default User-Agent, and
+    // adding a second one makes GitHub's asset CDN reject the request with 400.
     const res = try client.fetch(.{
         .location = .{ .url = url },
         .method = .GET,
-        .extra_headers = &.{.{ .name = "user-agent", .value = "contain" }},
         .response_writer = &aw.writer,
     });
     if (res.status != .ok) {

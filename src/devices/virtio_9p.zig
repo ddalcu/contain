@@ -51,8 +51,19 @@ const Tsymlink = 16;
 const Treadlink = 22;
 const Tgetattr = 24;
 const Tsetattr = 26;
+const Trename = 20; // Rrename = 21
 const Treaddir = 40;
+const Tfsync = 50; // Rfsync = 51
+const Tlock = 52; // Rlock = 53
+const Tgetlock = 54; // Rgetlock = 55
 const Tmkdir = 72;
+const Trenameat = 74; // Rrenameat = 75
+const Tunlinkat = 76; // Runlinkat = 77
+const AT_REMOVEDIR: u32 = 0x200;
+
+// 9P2000.L lock: F_* type values and Rlock status codes.
+const P9_LOCK_TYPE_UNLCK: u8 = 2; // no (conflicting) lock
+const P9_LOCK_SUCCESS: u8 = 0;
 const Tversion = 100;
 const Tattach = 104;
 const Tflush = 108;
@@ -64,7 +75,7 @@ const Tclunk = 120;
 const QTFILE: u8 = 0x00;
 const QTDIR: u8 = 0x80;
 
-const Fid = struct {
+pub const Fid = struct {
     path: []u8, // relative to the share root ("" = root)
 };
 
@@ -227,7 +238,7 @@ pub const Virtio9p = struct {
 
     // ---- 9P2000.L dispatch --------------------------------------------------
 
-    fn dispatch(self: *Virtio9p, t: []const u8, reply: []u8) usize {
+    pub fn dispatch(self: *Virtio9p, t: []const u8, reply: []u8) usize {
         if (t.len < 7) return 0;
         const ttype = t[4];
         const tag = rd16(t, 5);
@@ -290,6 +301,12 @@ pub const Virtio9p = struct {
                     w.put32(255);
                     break :blk Tstatfs + 1;
                 },
+                Tfsync => break :blk self.doFsync(t, &w),
+                Trename => break :blk self.doRename(t, &w) catch self.lerror(&w, 5),
+                Trenameat => break :blk self.doRenameat(t, &w) catch self.lerror(&w, 5),
+                Tunlinkat => break :blk self.doUnlinkat(t, &w) catch self.lerror(&w, 5),
+                Tlock => break :blk self.doLock(t, &w),
+                Tgetlock => break :blk self.doGetlock(t, &w),
                 Tflush => break :blk Tflush + 1,
                 else => break :blk self.lerror(&w, 95), // EOPNOTSUPP
             }
@@ -301,6 +318,51 @@ pub const Virtio9p = struct {
         reply[4] = rtype;
         std.mem.writeInt(u16, reply[5..7], tag, .little);
         return w.pos;
+    }
+
+    /// 9P2000.L fsync. Twrite already writes through to the host file, so there's no
+    /// deferred guest buffer to flush — acknowledge success. Without this the fsync
+    /// RPC fell through to EOPNOTSUPP and SQLite aborted with SQLITE_IOERR_FSYNC.
+    ///   Tfsync: fid[4] datasync[4]  ->  Rfsync: (no body)
+    fn doFsync(self: *Virtio9p, t: []const u8, w: *Writer) u8 {
+        const fid = rd32(t, 7);
+        _ = self.fids.get(fid) orelse return self.lerror(w, 9); // EBADF
+        return Tfsync + 1; // Rfsync
+    }
+
+    /// 9P2000.L byte-range advisory lock (fcntl POSIX locks — used by e.g. SQLite).
+    /// We grant every lock. contain maps one guest to one share, and the guest's
+    /// v9fs client records each granted lock in its own VFS lock table
+    /// (locks_lock_file_wait), so mutual exclusion *between guest processes* is
+    /// enforced client-side. The server's only other role is cross-client
+    /// coordination, which a single-guest share never needs. Without a handler the
+    /// lock RPC fell through to EOPNOTSUPP and SQLite aborted with "disk I/O error".
+    ///   Tlock: fid[4] type[1] flags[4] start[8] length[8] proc_id[4] client_id[s]
+    ///   Rlock: status[1]
+    fn doLock(self: *Virtio9p, t: []const u8, w: *Writer) u8 {
+        const fid = rd32(t, 7);
+        _ = self.fids.get(fid) orelse return self.lerror(w, 9); // EBADF
+        w.put8(P9_LOCK_SUCCESS);
+        return Tlock + 1; // Rlock
+    }
+
+    /// 9P2000.L test-lock (fcntl F_GETLK). We keep no server-side lock table, so we
+    /// always report "no conflicting lock" (F_UNLCK), echoing back the queried
+    /// range. SQLite relies on F_SETLK (granted above), not F_GETLK, for its locking.
+    ///   Tgetlock: fid[4] type[1] start[8] length[8] proc_id[4] client_id[s]
+    ///   Rgetlock: type[1] start[8] length[8] proc_id[4] client_id[s]
+    fn doGetlock(self: *Virtio9p, t: []const u8, w: *Writer) u8 {
+        const fid = rd32(t, 7);
+        _ = self.fids.get(fid) orelse return self.lerror(w, 9); // EBADF
+        const start = rd64(t, 12);
+        const length = rd64(t, 20);
+        const proc_id = rd32(t, 28);
+        w.put8(P9_LOCK_TYPE_UNLCK); // available: no conflicting lock
+        w.put64(start);
+        w.put64(length);
+        w.put32(proc_id);
+        w.putStr(""); // client_id (no holder)
+        return Tgetlock + 1; // Rgetlock
     }
 
     fn lerror(self: *Virtio9p, w: *Writer, errno: u32) u8 {
@@ -385,6 +447,74 @@ pub const Virtio9p = struct {
         const q = self.qidFor(child) catch return self.lerror(w, 2);
         w.putQid(q);
         return Tmkdir + 1;
+    }
+
+    /// 9P2000.L unlink a name under a directory fid (files or, with AT_REMOVEDIR,
+    /// empty dirs). SQLite deletes its journal/temp files through this; without it
+    /// the RPC returned EOPNOTSUPP and SQLite aborted with SQLITE_IOERR_DELETE.
+    ///   Tunlinkat: dfid[4] name[s] flags[4]  ->  Runlinkat: (no body)
+    fn doUnlinkat(self: *Virtio9p, t: []const u8, w: *Writer) !u8 {
+        const dfid = rd32(t, 7);
+        const nlen = rd16(t, 11);
+        const name = t[13 .. 13 + nlen];
+        const flags = rd32(t, 13 + nlen);
+        const parent = self.fids.get(dfid) orelse return self.lerror(w, 9);
+        const child = try self.joinPath(parent.path, name);
+        defer self.alloc.free(child);
+        const host = self.hostPath(child);
+        if (flags & AT_REMOVEDIR != 0)
+            std.Io.Dir.cwd().deleteDir(self.io, host) catch |err| return self.lerror(w, fsErrno(err))
+        else
+            std.Io.Dir.cwd().deleteFile(self.io, host) catch |err| return self.lerror(w, fsErrno(err));
+        return Tunlinkat + 1; // Runlinkat
+    }
+
+    /// 9P2000.L rename `fid` to `name` under directory `dfid`; the fid then refers to
+    /// the moved file. (The Linux client prefers Trenameat, but supports both.)
+    ///   Trename: fid[4] dfid[4] name[s]  ->  Rrename: (no body)
+    fn doRename(self: *Virtio9p, t: []const u8, w: *Writer) !u8 {
+        const f = self.fids.getPtr(rd32(t, 7)) orelse return self.lerror(w, 9);
+        const parent = self.fids.get(rd32(t, 11)) orelse return self.lerror(w, 9);
+        const nlen = rd16(t, 15);
+        const name = t[17 .. 17 + nlen];
+        const dst_rel = try self.joinPath(parent.path, name);
+        defer self.alloc.free(dst_rel);
+        // hostPath reuses one scratch buffer, so snapshot the source before building
+        // the destination.
+        const src_host = try self.alloc.dupe(u8, self.hostPath(f.path));
+        defer self.alloc.free(src_host);
+        const dst_host = self.hostPath(dst_rel);
+        std.Io.Dir.cwd().rename(src_host, std.Io.Dir.cwd(), dst_host, self.io) catch |err| return self.lerror(w, fsErrno(err));
+        const newpath = try self.alloc.dupe(u8, dst_rel);
+        self.alloc.free(f.path);
+        f.path = newpath;
+        return Trename + 1;
+    }
+
+    /// 9P2000.L rename oldname under olddirfid to newname under newdirfid.
+    ///   Trenameat: olddirfid[4] oldname[s] newdirfid[4] newname[s]  ->  Rrenameat
+    fn doRenameat(self: *Virtio9p, t: []const u8, w: *Writer) !u8 {
+        var off: usize = 7;
+        const olddir = self.fids.get(rd32(t, off)) orelse return self.lerror(w, 9);
+        off += 4;
+        const onlen = rd16(t, off);
+        off += 2;
+        const oldname = t[off .. off + onlen];
+        off += onlen;
+        const newdir = self.fids.get(rd32(t, off)) orelse return self.lerror(w, 9);
+        off += 4;
+        const nnlen = rd16(t, off);
+        off += 2;
+        const newname = t[off .. off + nnlen];
+        const src_rel = try self.joinPath(olddir.path, oldname);
+        defer self.alloc.free(src_rel);
+        const dst_rel = try self.joinPath(newdir.path, newname);
+        defer self.alloc.free(dst_rel);
+        const src_host = try self.alloc.dupe(u8, self.hostPath(src_rel));
+        defer self.alloc.free(src_host);
+        const dst_host = self.hostPath(dst_rel);
+        std.Io.Dir.cwd().rename(src_host, std.Io.Dir.cwd(), dst_host, self.io) catch |err| return self.lerror(w, fsErrno(err));
+        return Trenameat + 1;
     }
 
     fn doSymlink(self: *Virtio9p, t: []const u8, w: *Writer) !u8 {
@@ -479,6 +609,19 @@ pub const Virtio9p = struct {
     }
 
     // ---- host filesystem helpers -------------------------------------------
+
+    /// Map a host filesystem error to the Linux errno the 9p client expects.
+    fn fsErrno(err: anyerror) u32 {
+        return switch (err) {
+            error.FileNotFound => 2, // ENOENT
+            error.AccessDenied, error.PermissionDenied => 13, // EACCES
+            error.PathAlreadyExists => 17, // EEXIST
+            error.IsDir => 21, // EISDIR
+            error.NotDir => 20, // ENOTDIR
+            error.DirNotEmpty => 39, // ENOTEMPTY
+            else => 5, // EIO
+        };
+    }
 
     fn setFid(self: *Virtio9p, fid: u32, path: []const u8) !void {
         if (self.fids.fetchRemove(fid)) |kv| self.alloc.free(kv.value.path);

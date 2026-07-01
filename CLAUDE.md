@@ -31,9 +31,10 @@ have been removed now that the hardware backends are validated — see memory
 ## Commands
 
 ```sh
-zig build                          # debug build -> zig-out/bin/contain
+zig build                          # debug build -> zig-out/bin/contain (+ libcontain.a)
 zig build -Doptimize=ReleaseFast   # faster host device-model/NAT code
-zig build test                     # unit tests (16550/GIC/PVH/mptable/NAT)
+zig build test                     # unit tests (16550/GIC/PVH/mptable/NAT/console/session)
+zig build lib                      # embeddable static lib -> zig-out/lib/libcontain.a + include/contain.h
 ./tools/fetch_artifacts.sh         # fetch busybox + build demo initramfs (kernel auto-fetches)
 ```
 
@@ -54,6 +55,13 @@ src/
   main.zig              CLI (docker-style `run`); the embedded default init
                         script; interactive-tty + raw-terminal handling;
                         run/pull/boot/mkinitramfs/stripbtf
+  capi.zig              C ABI for embedding (export fn contain_*; see contain.h)
+  session.zig           library boot orchestration: start/writeInput/stop/deinit,
+                        no host TTY, no process.exit (the non-CLI cmdBoot)
+  console.zig           OutSink: pluggable guest-console output sink (callback or
+                        stdout fallback); used by both UARTs
+  rootfs.zig            rootfs-dir -> in-memory initramfs packing + the persistent
+                        agentic-shell /init builder (shared by CLI + session)
   machine.zig           the `virt` machine: memory map + device wiring; boot setup
   bus.zig               physical address space + MMIO device dispatch
   fdt.zig               builds the device tree (DTB) handed to the kernel
@@ -95,6 +103,41 @@ The guest CPU executes natively; the backend only handles VM exits — MMIO rout
 and `Machine.serviceDevicesHw` feeds console input + the UART line + the NAT
 pump/RX at each run-loop boundary. Devices reach guest memory through the `Bus`.
 
+## Embedding as a library (C ABI)
+
+Besides the CLI, contain builds an embeddable static library so it can run inside a
+host app (the motivating case: a **sandboxed macOS Swift app** driving an AI coding
+agent). `zig build lib` emits `zig-out/lib/libcontain.a` + `zig-out/include/contain.h`.
+
+- **`contain.h` API** — `contain_start(cfg)` boots a guest on a background thread and
+  returns an opaque handle; `contain_write(vm,bytes)` feeds the console (host->guest);
+  the `out_fn` callback delivers guest console output; `contain_stop(vm)` powers it off
+  mid-run; `contain_free(vm)` tears down. Plus `contain_fetch_kernel(dest)` and
+  `contain_pull_image(ref,dest,arch)` — both take an explicit **sandbox-writable path**.
+  `cfg.rootfs_dir` packs an unpacked OCI rootfs into an in-memory initramfs (no temp
+  cpio); the generated `/init` mounts the 9p share + brings up NAT + execs a persistent
+  shell (see `rootfs.buildShellInit`). The boot defaults to `contain.interactive` so the
+  guest waits for `contain_write` instead of auto-powering-off.
+- **Clean teardown (no `process.exit`)** — the library path must return to its caller,
+  so `Session.deinit` actually runs `Machine.deinit`. The old "joining NAT threads can
+  hang" problem is fixed in `nat.zig`: deinit `shutdown()`s each socket (a plain
+  `close()` does NOT wake a `recv()` blocked on another thread on macOS) and
+  self-connects to each published port to wake `accept()`, then joins. Stop is
+  cooperative: `Machine.requestStop` sets `stop_requested` (polled by the run loop +
+  WFI idle) and calls `accel_kick` (HVF `hv_vcpus_exit`) to break a blocked
+  `hv_vcpu_run`. **Kick is HVF-only so far**; KVM/WHP stop only at a loop boundary.
+- **Entitlements** — `contain-app.entitlements` is the reference plist for the embedding
+  app: `com.apple.security.hypervisor` is App Sandbox compatible on macOS (UTM ships
+  this on the Mac App Store). The userspace NAT needs only `network.client`/`.server`
+  (NOT the privileged `com.apple.vm.networking`). The `.a` itself isn't signed; the app
+  bundle is. The app must also link `-framework Hypervisor`.
+- **Apple-ld gotcha** — Zig's archiver writes members the classic Apple linker rejects
+  as "not 8-byte aligned". `tools/repack_lib.sh` (run automatically by `zig build lib`
+  on macOS) re-packs the archive with `libtool -static` so Xcode/Swift can link it.
+- **Validation** — `examples/smoke.c` is the C client + smoke test (start → write a
+  command → see the reply via `out_fn` → stop → free, no hang). Build/sign/run it per
+  the header comment; it doubles as the Swift call-sequence reference.
+
 ## Accel backends (hardware virtualization)
 
 The guest CPU runs natively (~hundreds of × faster than a software emulator). The
@@ -110,9 +153,14 @@ backend (`accel.autoDefault`).
   GIC's computed line via `hv_vcpu_set_pending_interrupt`; bridges HVF's real vtimer
   to GICv2 PPI 27. Handles exits: data-abort→MMIO, HVC/SMC→PSCI, **EC 0x18 trapped
   MSR/MRS** (shadow store — HVF traps debug/OS-lock/PMU regs), WFI→idle. Needs the
-  `com.apple.security.hypervisor` entitlement — `build.zig` links the `Hypervisor`
-  framework and ad-hoc-codesigns with `hv.entitlements` on aarch64-macOS (re-signing
-  each build trips a "code signer changed" firewall prompt — harmless).
+  `com.apple.security.hypervisor` entitlement — `build.zig` codesigns with
+  `hv.entitlements` on aarch64-macOS every build. It signs **ad-hoc** by default,
+  whose cdhash changes each rebuild, so a firewall (LuLu/Little Snitch) re-prompts
+  ("code signer changed") every build. Fix: sign with a **stable self-signed
+  code-signing cert** — create one once in Keychain (Certificate Assistant →
+  self-signed, type "Code Signing", e.g. `contain-dev`), then
+  `export CONTAIN_CODESIGN_ID=contain-dev` (or `zig build -Dsign-id=contain-dev`).
+  The signature's identity is then stable and the firewall rule persists.
 - **`src/accel/kvm.zig`** — Linux `/dev/kvm`. **x86 path done & proven on WSL2**
   (boots the x86-microvm kernel to userspace, virtio blk/9p/net, ~5.6 s, clean
   exit). arm64 path implemented + compile-validated, not yet runtime-tested (no

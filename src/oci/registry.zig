@@ -72,10 +72,12 @@ fn parseRef(gpa: std.mem.Allocator, ref: []const u8) !Ref {
 
 /// GET `url` and return the body (owned by `gpa`). `accept` / `token` add the
 /// Accept and (privileged, stripped-on-redirect) Authorization headers.
-fn httpGet(client: *http.Client, gpa: std.mem.Allocator, url: []const u8, accept: ?[]const u8, token: ?[]const u8) ![]u8 {
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    errdefer aw.deinit();
+// A pull fires ~20 sequential requests (token, manifest, config, N layers) with
+// long unpack gaps between them. Retry a few times so a transient network drop —
+// or a server closing an idle connection during those gaps — doesn't abort the pull.
+const http_max_attempts = 5;
 
+fn httpGet(client: *http.Client, gpa: std.mem.Allocator, url: []const u8, accept: ?[]const u8, token: ?[]const u8) ![]u8 {
     var extra: [2]http.Header = undefined;
     var extra_n: usize = 0;
     if (accept) |a| {
@@ -89,17 +91,38 @@ fn httpGet(client: *http.Client, gpa: std.mem.Allocator, url: []const u8, accept
         extra_n += 1;
     }
 
-    const res = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = extra[0..extra_n],
-        .response_writer = &aw.writer,
-    });
-    if (res.status != .ok) {
-        std.debug.print("[oci] GET {s} -> HTTP {d}\n", .{ url, @intFromEnum(res.status) });
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        // keep_alive = false: never pool the connection. A pooled keep-alive can be
+        // closed by the server while we spend seconds unpacking the previous layer,
+        // stranding the next request with error.HttpConnectionClosing. A fresh
+        // connection per request costs one handshake — negligible against the blob.
+        const res = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .extra_headers = extra[0..extra_n],
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch |err| {
+            aw.deinit();
+            if (attempt < http_max_attempts) {
+                std.debug.print("[oci] GET {s} failed ({s}); retry {d}/{d}\n", .{ url, @errorName(err), attempt, http_max_attempts });
+                continue;
+            }
+            return err;
+        };
+        if (res.status == .ok) return aw.toOwnedSlice();
+        aw.deinit();
+        // 429 (rate-limited) and 5xx are transient; other statuses are terminal.
+        const code = @intFromEnum(res.status);
+        if (attempt < http_max_attempts and (code == 429 or code >= 500)) {
+            std.debug.print("[oci] GET {s} -> HTTP {d}; retry {d}/{d}\n", .{ url, code, attempt, http_max_attempts });
+            continue;
+        }
+        std.debug.print("[oci] GET {s} -> HTTP {d}\n", .{ url, code });
         return error.HttpStatus;
     }
-    return aw.toOwnedSlice();
 }
 
 fn jsonStr(v: std.json.Value) []const u8 {
@@ -111,7 +134,16 @@ fn jsonStr(v: std.json.Value) []const u8 {
 
 /// Pull `image_ref` from Docker Hub for `arch`, unpack its rootfs into
 /// `dest_dir` (created if absent), and return the image config (arena-owned).
-pub fn pull(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, image_ref: []const u8, dest_dir: []const u8, arch: Arch) !ImageConfig {
+pub const PullOptions = struct {
+    /// Directory for the content-addressed blob cache (layer + config blobs keyed
+    /// by their sha256 digest). null disables blob caching (every blob re-downloaded).
+    cache_dir: ?[]const u8 = null,
+    /// When set, the raw image config JSON is written here so a later cached-rootfs
+    /// run can rebuild the guest /init fully offline (no network round-trip).
+    config_out: ?[]const u8 = null,
+};
+
+pub fn pull(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, image_ref: []const u8, dest_dir: []const u8, arch: Arch, opts: PullOptions) !ImageConfig {
     const ref = try parseRef(gpa, image_ref);
     defer {
         gpa.free(ref.repo);
@@ -168,9 +200,34 @@ pub fn pull(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, image_
     const config_digest = jsonStr((man_parsed.value.object.get("config") orelse return error.NoConfig).object.get("digest") orelse return error.NoConfig);
     const cfg_url = try std.fmt.allocPrint(gpa, "https://{s}/v2/{s}/blobs/{s}", .{ registry_host, ref.repo, config_digest });
     defer gpa.free(cfg_url);
-    const cfg_body = try httpGet(&client, gpa, cfg_url, null, token);
+    const cfg_body = try getBlob(&client, gpa, io, cfg_url, token, opts.cache_dir, config_digest);
     defer gpa.free(cfg_body);
     const config = try parseConfig(arena, gpa, cfg_body);
+
+    // Persist the raw config so a later cached-rootfs run rebuilds /init offline
+    // AND so contain_start can apply the image's ENV/WORKDIR. `config_out` may
+    // live inside dest_dir, so ensure the dir exists first (idempotent).
+    if (opts.config_out) |co| {
+        std.Io.Dir.cwd().createDirPath(io, dest_dir) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = co, .data = cfg_body }) catch |err|
+            std.debug.print("[oci] warn: could not cache image config: {s}\n", .{@errorName(err)});
+    }
+
+    // 3b. Fail fast if the resolved image isn't the requested architecture. The
+    // index step above filters a multi-arch manifest LIST, but a tag can point
+    // directly at a single-arch manifest (no list to filter) — Docker Hub then
+    // serves e.g. the amd64 image for an amd64-only repo regardless of `arch`.
+    // Without this check that wrong-arch rootfs is unpacked and later panics the
+    // guest with a cryptic ENOEXEC ("/bin/sh exists but couldn't execute it
+    // (error -8)" / "No working init found"). Checking here also avoids
+    // downloading the (large) layers for an image we can't run.
+    if (imageArchFromConfig(gpa, cfg_body)) |img_arch| {
+        defer gpa.free(img_arch);
+        if (!std.mem.eql(u8, img_arch, arch.str())) {
+            std.debug.print("[oci] {s}:{s} is {s}, not the requested {s} — this image/tag has no {s} build\n", .{ ref.repo, ref.tag, img_arch, arch.str(), arch.str() });
+            return error.ArchMismatch;
+        }
+    }
 
     // 4. Unpack each layer (gzip'd tar) into dest_dir, in order.
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);
@@ -184,13 +241,69 @@ pub fn pull(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, image_
         const ldigest = jsonStr(layer.object.get("digest") orelse return error.BadLayer);
         const lurl = try std.fmt.allocPrint(gpa, "https://{s}/v2/{s}/blobs/{s}", .{ registry_host, ref.repo, ldigest });
         defer gpa.free(lurl);
-        const gz = try httpGet(&client, gpa, lurl, null, token);
+        const gz = try getBlob(&client, gpa, io, lurl, token, opts.cache_dir, ldigest);
         defer gpa.free(gz);
         std.debug.print("[oci] layer {d}/{d} {s} ({d} bytes gz)\n", .{ i + 1, layers.len, ldigest[0..@min(19, ldigest.len)], gz.len });
         try extractLayer(io, root, gpa, gz, window);
     }
     std.debug.print("[oci] unpacked {d} layer(s) into {s}\n", .{ layers.len, dest_dir });
     return config;
+}
+
+// Per-blob read cap for the cache (the largest single layer we expect to reuse).
+const max_blob_bytes: usize = 4 * 1024 * 1024 * 1024;
+
+/// Fetch a content-addressed blob, using `cache_dir` as a read-through / write-back
+/// cache when set. Blobs are immutable (keyed by their sha256 digest), so a cache
+/// hit is always valid. The write goes via a ".part" temp + rename so a killed run
+/// never leaves a truncated blob to be served later.
+fn getBlob(client: *http.Client, gpa: std.mem.Allocator, io: std.Io, url: []const u8, token: ?[]const u8, cache_dir: ?[]const u8, digest: []const u8) ![]u8 {
+    const cd = cache_dir orelse return httpGet(client, gpa, url, null, token);
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, cd) catch {};
+    const path = try blobPath(gpa, cd, digest);
+    defer gpa.free(path);
+    if (cwd.readFileAlloc(io, path, gpa, .limited(max_blob_bytes))) |data| {
+        std.debug.print("[oci] cache hit {s}\n", .{digest[0..@min(19, digest.len)]});
+        return data;
+    } else |_| {}
+    const data = try httpGet(client, gpa, url, null, token);
+    errdefer gpa.free(data);
+    const part = try std.fmt.allocPrint(gpa, "{s}.part", .{path});
+    defer gpa.free(part);
+    if (cwd.writeFile(io, .{ .sub_path = part, .data = data })) |_| {
+        cwd.rename(part, cwd, path, io) catch cwd.deleteFile(io, part) catch {};
+    } else |_| {}
+    return data;
+}
+
+/// A blob's on-disk cache path: `<cache_dir>/<digest with ':' and '/' -> '-'>`.
+fn blobPath(gpa: std.mem.Allocator, cache_dir: []const u8, digest: []const u8) ![]u8 {
+    const safe = try gpa.dupe(u8, digest);
+    defer gpa.free(safe);
+    for (safe) |*c| {
+        if (c.* == ':' or c.* == '/') c.* = '-';
+    }
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ cache_dir, safe });
+}
+
+/// Read + parse a persisted image config JSON (written by pull's `config_out`),
+/// so a cached-rootfs run can rebuild /init without hitting the network.
+pub fn parseConfigFile(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ImageConfig {
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024));
+    defer gpa.free(body);
+    return parseConfig(arena, gpa, body);
+}
+
+/// The cache entry directory for an image ref + arch:
+/// `<base>/images/<repo>/<tag>@<arch>` (repo may itself contain '/'). Caller owns.
+pub fn cacheEntryPath(gpa: std.mem.Allocator, base: []const u8, image_ref: []const u8, arch: Arch) ![]u8 {
+    const ref = try parseRef(gpa, image_ref);
+    defer {
+        gpa.free(ref.repo);
+        gpa.free(ref.tag);
+    }
+    return std.fmt.allocPrint(gpa, "{s}/images/{s}/{s}@{s}", .{ base, ref.repo, ref.tag, arch.str() });
 }
 
 fn parseConfig(arena: std.mem.Allocator, gpa: std.mem.Allocator, body: []const u8) !ImageConfig {
@@ -204,6 +317,36 @@ fn parseConfig(arena: std.mem.Allocator, gpa: std.mem.Allocator, body: []const u
     if (c.object.get("WorkingDir")) |v| cfg.working_dir = try arena.dupe(u8, jsonStr(v));
     if (c.object.get("User")) |v| cfg.user = try arena.dupe(u8, jsonStr(v));
     return cfg;
+}
+
+/// Filename `contain_pull_image` writes the raw image config to, INSIDE the
+/// unpacked rootfs dir, so `session.start` can apply the image's ENV/WORKDIR to
+/// the guest (the library boot path has no other channel for image ENV — the
+/// CLI passes it directly). It rides along into the initramfs harmlessly.
+pub const embedded_config_name = ".contain-oci-config.json";
+
+/// Read the image config `contain_pull_image` persisted inside `rootfs_dir`
+/// (`embedded_config_name`), or null if it's absent/unreadable. Caller owns the
+/// returned config's slices (allocated from `arena`).
+pub fn readEmbeddedConfig(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, rootfs_dir: []const u8) ?ImageConfig {
+    const path = std.fs.path.join(gpa, &.{ rootfs_dir, embedded_config_name }) catch return null;
+    defer gpa.free(path);
+    return parseConfigFile(arena, gpa, io, path) catch return null;
+}
+
+/// The top-level `architecture` field of an OCI image config blob (e.g.
+/// "amd64", "arm64"), owned by `gpa`, or null if absent/unparseable. Used to
+/// verify a pulled image actually matches the requested arch: a tag can point
+/// straight at a single (non-index) manifest, which the index arch-selection in
+/// `pull` can't filter — so an amd64-only image requested as arm64 would
+/// otherwise be pulled and then panic the guest with ENOEXEC ("No working init").
+pub fn imageArchFromConfig(gpa: std.mem.Allocator, cfg_body: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, cfg_body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const a = parsed.value.object.get("architecture") orelse return null;
+    if (a != .string) return null;
+    return gpa.dupe(u8, a.string) catch null;
 }
 
 fn dupStrArray(arena: std.mem.Allocator, v: std.json.Value) ![]const []const u8 {
@@ -220,7 +363,17 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
 
     var name_buf: [std.fs.max_path_bytes]u8 = undefined;
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var iter = tar.Iterator.init(&dec.reader, .{ .file_name_buffer = &name_buf, .link_name_buffer = &link_buf });
+    // Passing diagnostics makes std.tar *skip* header types it can't represent
+    // (hard links, device nodes, FIFOs, sparse files) instead of failing the whole
+    // pull with error.TarUnsupportedHeader. Debian/Ubuntu-based images (node:*-slim,
+    // python:*-slim, …) contain these; we summarize what was skipped below.
+    var diag: tar.Diagnostics = .{ .allocator = gpa };
+    defer diag.deinit();
+    var iter = tar.Iterator.init(&dec.reader, .{
+        .file_name_buffer = &name_buf,
+        .link_name_buffer = &link_buf,
+        .diagnostics = &diag,
+    });
 
     // Windows cannot create on-disk symlinks without privilege, so record them in a
     // sidecar (path\ttarget\n) that packRootfs replays into the cpio (which does
@@ -279,6 +432,23 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
         }
     }
 
+    // std.tar's Iterator can't represent every header type. Device/FIFO skips are
+    // harmless (the guest's devtmpfs provides /dev). Hard links, though, mean a file
+    // name didn't land — recover them below rather than silently dropping them.
+    if (diag.errors.items.len != 0) {
+        var hard: usize = 0;
+        var special: usize = 0;
+        for (diag.errors.items) |e| switch (e) {
+            .unsupported_file_type => |u| switch (u.file_type) {
+                .hard_link => hard += 1,
+                else => special += 1,
+            },
+            else => {},
+        };
+        if (hard != 0) try recoverHardLinks(io, root, gpa, gz, window, hard);
+        if (special != 0) std.debug.print("[oci] note: skipped {d} device/special file(s) (guest devtmpfs provides /dev)\n", .{special});
+    }
+
     // Append this layer's symlinks to the sidecar (read-modify-write accumulates
     // across layers). Only on Windows, where real symlinks could not be created.
     if (builtin.os.tag == .windows and win_links.items.len != 0) {
@@ -290,4 +460,195 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
         try all.appendSlice(gpa, win_links.items);
         root.writeFile(io, .{ .sub_path = ".contain-symlinks", .data = all.items }) catch {};
     }
+}
+
+/// A hard-link tar entry: the link's path and the target it should share content
+/// with. Both are raw archive names (the caller normalizes the leading "./").
+pub const HardLink = struct { path: []u8, target: []u8 };
+
+pub fn freeHardLinks(gpa: std.mem.Allocator, links: *std.ArrayListUnmanaged(HardLink)) void {
+    for (links.items) |hl| {
+        gpa.free(hl.path);
+        gpa.free(hl.target);
+    }
+    links.deinit(gpa);
+}
+
+/// Re-scan a layer for the hard links std.tar dropped and materialize each one.
+/// A tar hard-link entry references a regular file archived earlier in the same
+/// layer, so the target already exists on disk from the main extraction pass —
+/// we just copy its content (permissions and all) to the link path.
+fn recoverHardLinks(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []const u8, window: []u8, expected: usize) !void {
+    var in = std.Io.Reader.fixed(gz);
+    var dec = flate.Decompress.init(&in, .gzip, window);
+    var links = collectHardLinks(gpa, &dec.reader) catch |err| {
+        std.debug.print("[oci] warn: hard-link recovery failed ({s}); {d} file(s) may be missing\n", .{ @errorName(err), expected });
+        return;
+    };
+    defer freeHardLinks(gpa, &links);
+
+    var linked: usize = 0;
+    for (links.items) |hl| {
+        const p = std.mem.trimStart(u8, hl.path, "./");
+        const t = std.mem.trimStart(u8, hl.target, "./");
+        if (p.len == 0 or t.len == 0) continue;
+        root.copyFile(t, root, p, io, .{ .make_path = true, .replace = true }) catch |err| {
+            std.debug.print("[oci] warn: hard link {s} -> {s}: {s}\n", .{ p, t, @errorName(err) });
+            continue;
+        };
+        linked += 1;
+    }
+    if (linked != 0) std.debug.print("[oci] linked {d} hard link(s)\n", .{linked});
+}
+
+/// Scan a decompressed tar stream and collect every hard-link entry's (path,
+/// target) — the fields std.tar's Iterator drops (it records only the path in
+/// diagnostics, never the target). Handles the ustar name+prefix split, GNU
+/// 'L'/'K' long-name/-link prefix entries, and pax 'x' path=/linkpath= overrides.
+/// Names are returned verbatim; the caller normalizes them to match the main pass.
+pub fn collectHardLinks(gpa: std.mem.Allocator, reader: *std.Io.Reader) !std.ArrayListUnmanaged(HardLink) {
+    var out: std.ArrayListUnmanaged(HardLink) = .empty;
+    errdefer freeHardLinks(gpa, &out);
+
+    // Overrides carried from a preceding meta header ('L'/'K'/'x'); each applies to
+    // the next real entry, then is cleared.
+    var ov_name: ?[]u8 = null;
+    var ov_link: ?[]u8 = null;
+    defer {
+        if (ov_name) |b| gpa.free(b);
+        if (ov_link) |b| gpa.free(b);
+    }
+
+    const max_meta: u64 = 1 << 20; // 1 MB cap on a long-name / pax data block
+    var hdr: [512]u8 = undefined;
+    var name_buf: [512]u8 = undefined;
+    while (true) {
+        reader.readSliceAll(&hdr) catch |err| switch (err) {
+            error.EndOfStream => break, // clean end (also covers trailing zero blocks)
+            else => return err,
+        };
+        if (tarIsZeroBlock(&hdr)) break; // end-of-archive marker
+
+        const typeflag = hdr[156];
+        const size = tarNumeric(hdr[124..136]);
+        const pad = std.mem.alignForward(u64, size, 512) - size;
+
+        switch (typeflag) {
+            'L' => { // GNU long name for the next entry
+                const raw = try tarReadMeta(gpa, reader, size, max_meta);
+                defer gpa.free(raw);
+                try reader.discardAll64(pad);
+                if (ov_name) |b| gpa.free(b);
+                ov_name = try gpa.dupe(u8, tarNullStr(raw));
+            },
+            'K' => { // GNU long link target for the next entry
+                const raw = try tarReadMeta(gpa, reader, size, max_meta);
+                defer gpa.free(raw);
+                try reader.discardAll64(pad);
+                if (ov_link) |b| gpa.free(b);
+                ov_link = try gpa.dupe(u8, tarNullStr(raw));
+            },
+            'x', 'X' => { // pax extended header: path=/linkpath= for the next entry
+                const raw = try tarReadMeta(gpa, reader, size, max_meta);
+                defer gpa.free(raw);
+                try reader.discardAll64(pad);
+                if (tarPaxValue(raw, "path")) |v| {
+                    if (ov_name) |b| gpa.free(b);
+                    ov_name = try gpa.dupe(u8, v);
+                }
+                if (tarPaxValue(raw, "linkpath")) |v| {
+                    if (ov_link) |b| gpa.free(b);
+                    ov_link = try gpa.dupe(u8, v);
+                }
+            },
+            'g' => try reader.discardAll64(size + pad), // pax global header: not name-related
+            '1' => { // hard link
+                const path = if (ov_name) |b| b else tarUstarName(&hdr, &name_buf);
+                const target = if (ov_link) |b| b else tarNullStr(hdr[157..257]);
+                if (path.len != 0 and target.len != 0) {
+                    try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .target = try gpa.dupe(u8, target) });
+                }
+                if (ov_name) |b| gpa.free(b);
+                ov_name = null;
+                if (ov_link) |b| gpa.free(b);
+                ov_link = null;
+                try reader.discardAll64(size + pad); // hard links carry no data, but be safe
+            },
+            else => { // file / dir / symlink / device / sparse: skip data, drop overrides
+                if (ov_name) |b| gpa.free(b);
+                ov_name = null;
+                if (ov_link) |b| gpa.free(b);
+                ov_link = null;
+                try reader.discardAll64(size + pad);
+            },
+        }
+    }
+    return out;
+}
+
+fn tarIsZeroBlock(b: *const [512]u8) bool {
+    for (b) |x| if (x != 0) return false;
+    return true;
+}
+
+/// Break a fixed tar field on its first NUL.
+fn tarNullStr(s: []const u8) []const u8 {
+    return s[0 .. std.mem.indexOfScalar(u8, s, 0) orelse s.len];
+}
+
+/// Parse a tar numeric field: octal ASCII, or GNU base-256 when the leading byte
+/// has its high bit set. Mirrors std.tar's size handling.
+fn tarNumeric(raw: []const u8) u64 {
+    if (raw.len == 0) return 0;
+    if (raw[0] & 0x80 != 0) {
+        var v: u64 = 0;
+        for (raw, 0..) |b, i| v = (v << 8) | @as(u64, if (i == 0) b & 0x7f else b);
+        return v;
+    }
+    const t = std.mem.trimEnd(u8, std.mem.trimStart(u8, raw, "0 "), " \x00");
+    if (t.len == 0) return 0;
+    return std.fmt.parseInt(u64, t, 8) catch 0;
+}
+
+/// The ustar name for a header: name(0,100), prefixed by prefix(345,155) joined
+/// with '/' when the POSIX ustar magic is present and the prefix is set.
+fn tarUstarName(hdr: *const [512]u8, out: *[512]u8) []const u8 {
+    const name = tarNullStr(hdr[0..100]);
+    const magic = hdr[257..263];
+    const is_ustar = std.mem.eql(u8, magic[0..5], "ustar") and (magic[5] == 0 or magic[5] == ' ');
+    const prefix = if (is_ustar) tarNullStr(hdr[345..500]) else "";
+    if (prefix.len == 0) {
+        @memcpy(out[0..name.len], name);
+        return out[0..name.len];
+    }
+    @memcpy(out[0..prefix.len], prefix);
+    out[prefix.len] = '/';
+    @memcpy(out[prefix.len + 1 ..][0..name.len], name);
+    return out[0 .. prefix.len + 1 + name.len];
+}
+
+/// Read a meta header's `size`-byte data block (GNU long name / pax records).
+fn tarReadMeta(gpa: std.mem.Allocator, reader: *std.Io.Reader, size: u64, max: u64) ![]u8 {
+    if (size == 0) return gpa.alloc(u8, 0);
+    if (size > max) return error.TarMetaTooBig;
+    const buf = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(buf);
+    try reader.readSliceAll(buf);
+    return buf;
+}
+
+/// Look up a pax record value by key. Records are `"<len> <key>=<value>\n"`,
+/// where <len> counts the whole record (length digits, space, key, value, LF).
+fn tarPaxValue(data: []const u8, key: []const u8) ?[]const u8 {
+    var rest = data;
+    while (rest.len != 0) {
+        const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse break;
+        const len = std.fmt.parseInt(usize, rest[0..sp], 10) catch break;
+        if (len <= sp or len > rest.len) break;
+        const kv = rest[sp + 1 .. len]; // "key=value\n"
+        rest = rest[len..];
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        if (std.mem.eql(u8, kv[0..eq], key)) return std.mem.trimEnd(u8, kv[eq + 1 ..], "\n");
+    }
+    return null;
 }

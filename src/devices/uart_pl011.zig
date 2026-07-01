@@ -8,6 +8,7 @@
 //! kernel's console driver is happy.
 
 const std = @import("std");
+const OutSink = @import("../console.zig").OutSink;
 
 pub const Pl011 = struct {
     pub const base: u64 = 0x0900_0000;
@@ -36,9 +37,11 @@ pub const Pl011 = struct {
     const periph_id = [_]u8{ 0x11, 0x10, 0x14, 0x00 }; // 0xFE0..0xFEC
     const pcell_id = [_]u8{ 0x0d, 0xf0, 0x05, 0xb1 }; // 0xFF0..0xFFC
 
-    // Host IO + stdout for emitted bytes.
+    // Host IO + stdout for emitted bytes. When `sink` has a callback, output is
+    // delivered there instead (library embedding); otherwise it goes to stdout.
     io: std.Io,
     out: std.Io.File,
+    sink: OutSink = .{},
     // Input ring buffer (filled by the host stdin reader thread in M1).
     rx_buf: [256]u8 = undefined,
     rx_head: usize = 0,
@@ -231,7 +234,8 @@ pub const Pl011 = struct {
         switch (offset) {
             DR => {
                 const byte: u8 = @truncate(value);
-                self.out.writeStreamingAll(self.io, &[_]u8{byte}) catch {};
+                if (!self.sink.emit(&[_]u8{byte}))
+                    self.out.writeStreamingAll(self.io, &[_]u8{byte}) catch {};
                 self.trackOutput(byte);
             },
             CR => self.cr = @truncate(value),

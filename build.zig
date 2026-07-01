@@ -1,4 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Pin the toolchain. contain tracks Zig 0.16.x exactly — the std `Io` API and
+// several stdlib names differ on both earlier and later versions (see CLAUDE.md),
+// so fail early with a clear message instead of deep inside a stdlib mismatch.
+comptime {
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 16)
+        @compileError("contain requires Zig 0.16.x; found Zig " ++ builtin.zig_version_string);
+}
 
 pub fn build(b: *std.Build) void {
     // Default to the *host* CPU model when no explicit -Dtarget is given: letting
@@ -27,15 +36,58 @@ pub fn build(b: *std.Build) void {
     const install = b.addInstallArtifact(exe, .{});
 
     if (is_aarch64_macos) {
-        // Ad-hoc codesign with the hypervisor entitlement so `CONTAIN_ACCEL=hvf`
-        // can create a VM (HVF returns HV_DENIED without it). Runs after install
-        // so it signs the binary in zig-out/bin; the default build depends on it.
-        const sign = b.addSystemCommand(&.{ "codesign", "--entitlements", "hv.entitlements", "--force", "-s", "-" });
+        // Codesign with the hypervisor entitlement so `CONTAIN_ACCEL=hvf` can create
+        // a VM (HVF returns HV_DENIED without it). Runs after install so it signs the
+        // binary in zig-out/bin; the default build depends on it.
+        //
+        // Identity: ad-hoc ("-") by default. Ad-hoc has NO stable identity, so its
+        // cdhash changes on every rebuild and a firewall like LuLu re-prompts each
+        // build ("code signer changed"). Point this at a persistent self-signed
+        // code-signing cert to stop that — the signature's identity is then stable,
+        // so the firewall rule survives rebuilds. Set it via -Dsign-id=<name> or the
+        // CONTAIN_CODESIGN_ID env var (see README: create the cert once in Keychain).
+        const env_sign_id = b.graph.environ_map.get("CONTAIN_CODESIGN_ID");
+        const sign_id = b.option([]const u8, "sign-id", "codesign identity for the HVF entitlement (default: ad-hoc '-')") orelse (env_sign_id orelse "-");
+        const sign = b.addSystemCommand(&.{ "codesign", "--entitlements", "hv.entitlements", "--force", "-s", sign_id });
         sign.addArg(b.getInstallPath(.bin, "contain"));
         sign.step.dependOn(&install.step);
         b.getInstallStep().dependOn(&sign.step);
     } else {
         b.getInstallStep().dependOn(&install.step);
+    }
+
+    // --- embeddable static library (src/capi.zig -> libcontain.a + contain.h) ---
+    // Links into a host app (e.g. a sandboxed Swift app driving an AI agent). The
+    // archive itself isn't codesigned; the embedding app bundle is signed with the
+    // combined entitlements (see contain-app.entitlements). On Apple Silicon the
+    // app must also link `-framework Hypervisor`.
+    const lib = b.addLibrary(.{
+        .name = "contain",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = is_aarch64_macos,
+        }),
+    });
+    if (is_aarch64_macos) lib.root_module.linkFramework("Hypervisor", .{});
+    const lib_install = b.addInstallArtifact(lib, .{});
+    const header_install = b.addInstallFile(b.path("include/contain.h"), "include/contain.h");
+    const lib_step = b.step("lib", "Build the embeddable static library + C header");
+    lib_step.dependOn(&lib_install.step);
+    lib_step.dependOn(&header_install.step);
+    b.getInstallStep().dependOn(&lib_install.step);
+    b.getInstallStep().dependOn(&header_install.step);
+
+    // On macOS, re-pack the archive so Apple's ld (Xcode/Swift) accepts it: Zig's
+    // archiver emits members the classic linker rejects as "not 8-byte aligned".
+    if (target.result.os.tag == .macos) {
+        const repack = b.addSystemCommand(&.{ "sh", "tools/repack_lib.sh" });
+        repack.addArg(b.getInstallPath(.lib, "libcontain.a"));
+        repack.step.dependOn(&lib_install.step);
+        lib_step.dependOn(&repack.step);
+        b.getInstallStep().dependOn(&repack.step);
     }
 
     const run_cmd = b.addRunArtifact(exe);

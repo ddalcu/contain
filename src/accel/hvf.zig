@@ -114,6 +114,15 @@ fn hvOk(ret: c_int, comptime what: []const u8) !void {
     return error.HvfCallFailed;
 }
 
+/// Force the vCPU out of a blocking `hv_vcpu_run` (yields HV_EXIT_CANCELED, which
+/// the run loop treats as "re-check + re-run"). hv_vcpus_exit is documented as
+/// safe to call from another thread, so this is what `Machine.requestStop` uses
+/// to make a mid-run stop take effect promptly. Registered as `m.accel_kick`.
+fn kickVcpu(vcpu: u64) void {
+    var v: hv_vcpu_t = vcpu;
+    _ = hv_vcpus_exit(@as([*]const hv_vcpu_t, @ptrCast(&v)), 1);
+}
+
 fn getReg(vcpu: hv_vcpu_t, reg: c_int) u64 {
     var v: u64 = 0;
     _ = hv_vcpu_get_reg(vcpu, reg, &v);
@@ -215,6 +224,15 @@ fn runImpl(m: *Machine) !void {
     try hvOk(hv_vcpu_create(&vcpu, &exit, null), "hv_vcpu_create");
     defer _ = hv_vcpu_destroy(vcpu);
 
+    // Let Machine.requestStop() (possibly on another thread) break this vCPU out
+    // of a blocking run. Cleared before the vCPU is destroyed (defers run LIFO).
+    m.accel_vcpu = vcpu;
+    m.accel_kick = kickVcpu;
+    defer {
+        m.accel_kick = null;
+        m.accel_vcpu = 0;
+    }
+
     // arm64 Linux boot protocol (mirrors machine.bootLinux): PC=kernel, X0=DTB,
     // X1..3 = 0, entering at EL1h with interrupts masked.
     setReg(vcpu, HV_REG_PC, machine_mod.kernel_load);
@@ -230,7 +248,7 @@ fn runImpl(m: *Machine) !void {
     var vtimer_masked = false;
     var shadow: SysregShadow = .{};
 
-    while (running) {
+    while (running and !m.stop_requested.load(.acquire)) {
         syncVtimer(vcpu, m, &vtimer_masked);
         m.serviceDevicesHw();
         // Not sticky — re-assert the GIC's current line on every entry.
@@ -331,6 +349,7 @@ fn handleWfx(vcpu: hv_vcpu_t, m: *Machine) void {
     setReg(vcpu, HV_REG_PC, getReg(vcpu, HV_REG_PC) +% 4);
     const slice_ns: u64 = 5 * std.time.ns_per_ms;
     while (true) {
+        if (m.stop_requested.load(.acquire)) return; // let a mid-run stop break idle
         m.serviceDevicesHw();
         if (m.irq.pending) return;
 

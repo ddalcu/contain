@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const Gicv2 = @import("gicv2.zig").Gicv2;
+const OutSink = @import("../console.zig").OutSink;
 
 pub const Uart16550 = struct {
     pub const base_port: u16 = 0x3F8;
@@ -42,6 +43,7 @@ pub const Uart16550 = struct {
 
     io: std.Io,
     out: std.Io.File,
+    sink: OutSink = .{}, // when set, guest output goes here instead of stdout
     gic: *Gicv2,
     irq_id: u32, // GSI / line number (COM1 = 4)
 
@@ -145,7 +147,8 @@ pub const Uart16550 = struct {
                 if (self.dlab()) {
                     self.dll = v;
                 } else {
-                    self.out.writeStreamingAll(self.io, &[_]u8{v}) catch {};
+                    if (!self.sink.emit(&[_]u8{v}))
+                        self.out.writeStreamingAll(self.io, &[_]u8{v}) catch {};
                     // TX done immediately -> re-arm the THR-empty interrupt.
                     if ((self.ier & IER_THR_EMPTY) != 0) self.thr_int_pending = true;
                     self.syncIrq();
