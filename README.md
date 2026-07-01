@@ -59,6 +59,13 @@ contain run -p 8080:3000 node:22-alpine \
 
 # Everything together (an interactive dev sandbox, Docker-style)
 contain run -it -p 8080:8080 -v ./code:/app python:3-alpine
+
+# Build an image from a Dockerfile — a drop-in for `docker build`
+contain build -t myapp .
+contain run myapp
+
+# Run a multi-service compose.yaml — `contain compose up` / `build` / `config`
+contain compose up
 ```
 
 The flags mirror `docker run`:
@@ -66,7 +73,7 @@ The flags mirror `docker run`:
 | flag | meaning |
 |---|---|
 | `-i`, `-t`, `-it` | interactive shell (attach your terminal); exit the shell to power off |
-| `-v <host>:<container>` | mount a host directory at the container path (read-write, via 9p) |
+| `-v <host>:<container>` | mount a host directory at the container path (read-write, via virtio-fs; 9p on arm64) |
 | `-p <host>:<guest>` | publish a guest TCP port on the host's `127.0.0.1` (repeatable) |
 | `-e <KEY=VALUE>` | set an environment variable (repeatable) |
 | `-w <dir>` | working directory for the command |
@@ -92,10 +99,22 @@ image's rootfs without running it, use `contain pull <image>`. For full control
   implements the virtio-mmio transport (modern/v2, split virtqueues) and a
   virtio-blk device backed by a **host file**. The guest creates `/dev/vda` and
   disk I/O **persists to the host file across boots**.
-- **Live host-directory mounts (virtio-9p)** — `src/devices/virtio_9p.zig`
-  implements a 9P2000.L device; the guest `mount -t 9p host /host` exposes a **host
-  directory live** — it lists and reads host files and writes new files straight
-  back to the host filesystem.
+- **Live host-directory mounts (virtio-fs / FUSE)** — `src/devices/virtio_fs.zig`
+  is a from-scratch virtio-fs device speaking the FUSE low-level protocol; the guest
+  `mount -t virtiofs host /host` exposes a **host directory live** with full POSIX
+  semantics (proper inodes, symlinks, `fsync`, byte-range locks — SQLite and friends
+  work). It's the default share transport on x86; `src/devices/virtio_9p.zig` (a
+  9P2000.L device) remains the arm64 default and the `CONTAIN_SHARE_FS=9p` fallback.
+- **Memory-efficient rootfs (rootfs over virtio-fs)** — on x86, `contain run` mounts
+  the image's rootfs as the guest's real root over virtio-fs and **demand-pages** it
+  from the host, instead of packing the whole image into an in-RAM initramfs. Only
+  the pages the workload actually touches become resident, so a heavy image runs in a
+  fraction of the memory (default guest RAM is 1 GB, `-m` to change).
+- **`contain build` and `contain compose`** — `contain build -t name .` builds an
+  image from a Dockerfile (`src/build.zig`: FROM/RUN/COPY/ADD/ENV/WORKDIR/CMD/
+  ENTRYPOINT/ARG; each RUN executes in a guest over virtio-fs so steps compose).
+  `contain compose up` runs a multi-service `compose.yaml` (`src/compose.zig`), each
+  service a guest reachable via its published ports.
 - **Networking (virtio-net + userspace NAT)** — `src/devices/virtio_net.zig` +
   `src/net/nat.zig` implement a virtio-net device and a slirp-style NAT (ARP, ICMP,
   DHCP, DNS forwarding, and a TCP/UDP relay to the real host network). The guest
@@ -109,8 +128,8 @@ image's rootfs without running it, use `contain pull <image>`. For full control
   the network, and compile/run it in isolation.
 - **OCI / Docker Hub images** — `src/oci/registry.zig` does the Docker Hub token
   dance, multi-arch index, gzip-tar layers and whiteouts over `std.http.Client` TLS,
-  with no docker, skopeo or external tools; the unpacked rootfs is packed into the
-  initramfs and booted on the host backend.
+  with no docker, skopeo or external tools; the unpacked rootfs is mounted over
+  virtio-fs (x86) or packed into the initramfs (arm64) and booted on the host backend.
 
 ## Hardware virtualization (HVF / KVM / WHP)
 

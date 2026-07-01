@@ -12,7 +12,9 @@ Silicon, **KVM** on x86/arm64 Linux, **WHP** on x86 Windows), reusing the same
 from-scratch device models, `Bus`, GIC/IOAPIC and userspace NAT on every backend.
 It also pulls and runs public **OCI/Docker images** (from-scratch registry client,
 no external tools): `contain run` is a drop-in for `docker run` —
-`contain run node:22-alpine node ...` runs node natively.
+`contain run node:22-alpine node ...` runs node natively. `contain build` builds
+images from a Dockerfile and `contain compose up` runs a multi-service
+`compose.yaml` — same syntax as Docker (x86 only for now; see the virtiofs note).
 
 Each host runs a native-arch Linux guest (host-ISA == guest-ISA), so acceleration
 always applies. Complete: shell, virtio-blk with host persistence, virtio-9p
@@ -52,9 +54,14 @@ Windows); `CONTAIN_ACCEL=hvf|kvm|whp` overrides it.
 
 ```
 src/
-  main.zig              CLI (docker-style `run`); the embedded default init
-                        script; interactive-tty + raw-terminal handling;
-                        run/pull/boot/mkinitramfs/stripbtf
+  main.zig              CLI (docker-style `run`/`build`/`compose`); the embedded
+                        default init script; interactive-tty + raw-terminal
+                        handling; run/build/compose/pull/boot/mkinitramfs/stripbtf.
+                        `run` on x86 mounts the image rootfs over virtio-fs
+                        (demand-paged root=rootfs) instead of an in-RAM initramfs
+                        — the big memory win (see contain-virtiofs-build-compose).
+  build.zig             Dockerfile parser (core instruction set) for `contain build`
+  compose.zig           compose.yaml parser (service subset) for `contain compose`
   capi.zig              C ABI for embedding (export fn contain_*; see contain.h)
   session.zig           library boot orchestration: start/writeInput/stop/deinit,
                         no host TTY, no process.exit (the non-CLI cmdBoot)
@@ -85,7 +92,9 @@ src/
     i8259.zig           PIC (probe)} arm64 uses the GIC instead.
     cmos.zig            MC146818 RTC (x86; stops the kernel's UIP poll)
     virtio.zig          virtio-mmio transport + virtio-blk (host-file backed)
-    virtio_9p.zig       virtio-9p / 9P2000.L (host-directory backed)
+    virtio_9p.zig       virtio-9p / 9P2000.L (host-directory backed; arm64 default)
+    virtio_fs.zig       virtio-fs / FUSE (host-dir backed; DEFAULT share + rootfs
+                        transport on x86 — POSIX-complete, symlink-sidecar aware)
     virtio_net.zig      virtio-net device (RX/TX virtqueues)
     virtio_rng.zig      virtio-rng (always-on entropy; essential under hw-virt)
   net/nat.zig           userspace slirp-style NAT (ARP/ICMP/DHCP/DNS + TCP/UDP relay

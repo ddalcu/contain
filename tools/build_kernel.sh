@@ -76,6 +76,11 @@ if [ "$ARCH_SEL" = arm64 ]; then
   m --enable  VIRTIO_BLK --enable VIRTIO_NET
   m --enable  HW_RANDOM --enable HW_RANDOM_VIRTIO
   m --enable  NET_9P --enable NET_9P_VIRTIO --enable 9P_FS
+  # virtio-fs (FUSE): the default host-share + rootfs transport (see memory
+  # contain-virtiofs-build-compose). Non-DAX (no shared-memory window).
+  m --enable  FUSE_FS --enable VIRTIO_FS
+  m --disable FUSE_DAX
+  m --enable  OVERLAY_FS
   m --enable  SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE
   m --enable  BLK_DEV_INITRD
   # Trim defconfig hard for a headless virtio guest: no ACPI (we boot from a
@@ -93,6 +98,7 @@ if [ "$ARCH_SEL" = arm64 ]; then
   m --enable EXT4_FS --enable OVERLAY_FS --enable TMPFS
   m --enable NETDEVICES --enable VIRTIO_NET
   make ARCH=arm64 O=build-arm64 olddefconfig
+  for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS; do grep -q "^$s=y" build-arm64/.config || { echo "ERROR: $s not =y (olddefconfig dropped it)"; exit 1; }; done
   make ARCH=arm64 O=build-arm64 -j"$J" Image
   install -m644 build-arm64/arch/arm64/boot/Image /out/Image-arm64
   gzip -9 -c build-arm64/arch/arm64/boot/Image > /out/release/Image-arm64.gz
@@ -112,6 +118,10 @@ elif [ "$ARCH_SEL" = x86_64 ]; then
   m --enable  VIRTIO_BLK --enable VIRTIO_NET
   m --enable  HW_RANDOM --enable HW_RANDOM_VIRTIO
   m --enable  NET_9P --enable NET_9P_VIRTIO --enable 9P_FS
+  # virtio-fs (FUSE): default host-share + rootfs-over-virtiofs transport on x86.
+  m --enable  FUSE_FS --enable VIRTIO_FS
+  m --disable FUSE_DAX
+  m --enable  OVERLAY_FS
   m --disable DEFERRED_STRUCT_PAGE_INIT --disable NUMA
   m --disable RANDOMIZE_BASE --disable RANDOMIZE_MEMORY
   m --set-val NR_CPUS 1
@@ -122,6 +132,7 @@ elif [ "$ARCH_SEL" = x86_64 ]; then
            BT NFC HID IIO STAGING; do m --disable "$o"; done
   m --disable DEBUG_INFO   # keep vmlinux small WITHOUT stripping (strip drops the PVH note)
   make ARCH=x86_64 CROSS_COMPILE=$X O=build-x86 olddefconfig
+  for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS; do grep -q "^$s=y" build-x86/.config || { echo "ERROR: $s not =y (olddefconfig dropped it)"; exit 1; }; done
   make ARCH=x86_64 CROSS_COMPILE=$X O=build-x86 -j"$J" vmlinux
   # Ship vmlinux as-is — do NOT strip: `strip` removes the `.note.Xen` PT_NOTE
   # that PVH (PHYS32_ENTRY) boot requires. Assert the note on the shipped file.
