@@ -12,6 +12,7 @@ const registry = @import("oci/registry.zig");
 const rootfs = @import("rootfs.zig");
 const kernel_fetch = @import("kernel_fetch.zig");
 const build_mod = @import("build.zig");
+const compose_mod = @import("compose.zig");
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
 const Uart16550 = @import("devices/uart_16550.zig").Uart16550;
 
@@ -341,6 +342,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "build")) {
         const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
         try cmdBuild(gpa, io, args[2..], cache_base);
+    } else if (std.mem.eql(u8, cmd, "compose")) {
+        const cache_base = resolveCacheDir(init.arena.allocator(), init.environ_map);
+        try cmdCompose(gpa, io, args[2..], cache_base);
     } else {
         usage();
     }
@@ -446,6 +450,9 @@ fn usage() void {
         \\                                build an image from a Dockerfile (FROM/RUN/
         \\                                COPY/ADD/ENV/WORKDIR/CMD/ENTRYPOINT/ARG);
         \\                                run it with `contain run NAME` (x86 only)
+        \\  contain compose [-f FILE] up|build|config [SERVICE...]
+        \\                                run a multi-service compose.yaml (each
+        \\                                service is a guest; published ports only)
         \\  contain pull <image> [dir] [arch]   unpack an image's rootfs to <dir>
         \\                                      (default: ./<image>-rootfs)
         \\  contain boot <kernel> [initramfs] [input] [disk] [share] [ports]
@@ -990,6 +997,212 @@ pub fn parseRunArgs(arena: std.mem.Allocator, args: []const [:0]const u8, accel_
 /// later run of the same ref reuses the cache with no network and no re-unpack
 /// (`--pull always` forces a refresh; `--pull never` requires the cache). Layer/
 /// config blobs are also cached by digest under `<cache_base>/blobs`.
+/// `contain compose [-f FILE] [-p PROJECT] SUBCOMMAND [SERVICE...]` — a docker-
+/// compose-style multi-service runner. SUBCOMMANDs: up (run services), build (build
+/// services that declare `build:`), config (print the parsed model), down (stop —
+/// see note). Each service becomes a `contain run` (or `contain build`) subprocess,
+/// reusing the whole pipeline. NOTE: inter-service networking (reaching another
+/// service by name) is NOT modeled — each service has its own userspace NAT and
+/// host port-forwards; use published ports for host access.
+fn cmdCompose(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cache_base: []const u8) !void {
+    _ = cache_base;
+    var file: ?[]const u8 = null;
+    var project: []const u8 = "contain";
+    var sub: []const u8 = "up";
+    var only: std.ArrayListUnmanaged([]const u8) = .empty;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var i: usize = 0;
+    var got_sub = false;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--file")) {
+            i += 1;
+            if (i < args.len) file = args[i];
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--project-name")) {
+            i += 1;
+            if (i < args.len) project = args[i];
+        } else if (a.len > 0 and a[0] == '-') {
+            // ignore other global flags (e.g. -d) for now
+        } else if (!got_sub) {
+            sub = a;
+            got_sub = true;
+        } else {
+            try only.append(arena, a);
+        }
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const path = file orelse findComposeFile(io) orelse {
+        std.debug.print("contain compose: no compose file found (compose.yaml / docker-compose.yml)\n", .{});
+        return;
+    };
+    const src = cwd.readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        std.debug.print("contain compose: cannot read '{s}': {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer gpa.free(src);
+    var comp = compose_mod.parse(gpa, src) catch |err| {
+        std.debug.print("contain compose: parse error in '{s}': {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer comp.deinit();
+
+    // Order services so a service starts after the ones it depends_on.
+    const order = try orderServices(arena, comp.services);
+
+    const exe = try std.process.executablePathAlloc(io, arena);
+
+    if (std.mem.eql(u8, sub, "config")) {
+        for (comp.services) |*s| printService(s);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "down")) {
+        std.debug.print("[compose] `up` runs in the foreground; stop it with Ctrl-C to bring the project down.\n", .{});
+        return;
+    }
+    const do_build = std.mem.eql(u8, sub, "build");
+    const do_up = std.mem.eql(u8, sub, "up");
+    if (!do_build and !do_up) {
+        std.debug.print("contain compose: unknown subcommand '{s}' (use: up | build | config | down)\n", .{sub});
+        return;
+    }
+
+    // Build phase: every service that declares `build:` (both for `build` and as a
+    // prerequisite of `up`).
+    for (order) |idx| {
+        const s = &comp.services[idx];
+        if (!wanted(only.items, s.name)) continue;
+        if (s.build) |ctx| {
+            const tag = try std.fmt.allocPrint(arena, "{s}_{s}:latest", .{ project, s.name });
+            std.debug.print("[compose] building service '{s}' -> {s}\n", .{ s.name, tag });
+            var bargv: std.ArrayListUnmanaged([]const u8) = .empty;
+            try bargv.appendSlice(arena, &.{ exe, "build", "-t", tag, ctx });
+            const term = try spawnWait(io, arena, bargv.items);
+            if (term != .exited or term.exited != 0) {
+                std.debug.print("contain compose: build of '{s}' failed\n", .{s.name});
+                return;
+            }
+        }
+    }
+    if (do_build) {
+        std.debug.print("[compose] build complete.\n", .{});
+        return;
+    }
+
+    // Up phase: spawn each service's `contain run`, then wait on them all. Output is
+    // inherited (interleaved). Ctrl-C on the compose process tears down the group.
+    var children: std.ArrayListUnmanaged(std.process.Child) = .empty;
+    for (order) |idx| {
+        const s = &comp.services[idx];
+        if (!wanted(only.items, s.name)) continue;
+        const image = if (s.build != null)
+            try std.fmt.allocPrint(arena, "{s}_{s}:latest", .{ project, s.name })
+        else
+            (s.image orelse {
+                std.debug.print("contain compose: service '{s}' has neither image nor build\n", .{s.name});
+                continue;
+            });
+        var rargv: std.ArrayListUnmanaged([]const u8) = .empty;
+        try rargv.appendSlice(arena, &.{ exe, "run", "--name", s.name });
+        for (s.ports.items) |p| try rargv.appendSlice(arena, &.{ "-p", p });
+        for (s.volumes.items) |v| try rargv.appendSlice(arena, &.{ "-v", v });
+        for (s.env.items) |e| try rargv.appendSlice(arena, &.{ "-e", e });
+        try rargv.append(arena, image);
+        if (s.command) |c| for (try shellSplit(arena, c)) |w| try rargv.append(arena, w);
+
+        std.debug.print("[compose] starting service '{s}' ({s})\n", .{ s.name, image });
+        const child = std.process.spawn(io, .{ .argv = rargv.items }) catch |err| {
+            std.debug.print("contain compose: failed to start '{s}': {s}\n", .{ s.name, @errorName(err) });
+            continue;
+        };
+        try children.append(arena, child);
+    }
+
+    for (children.items) |*ch| _ = ch.wait(io) catch {};
+    std.debug.print("[compose] all services exited.\n", .{});
+}
+
+fn wanted(only: []const []const u8, name: []const u8) bool {
+    if (only.len == 0) return true;
+    for (only) |o| if (std.mem.eql(u8, o, name)) return true;
+    return false;
+}
+
+fn spawnWait(io: std.Io, arena: std.mem.Allocator, argv: []const []const u8) !std.process.Child.Term {
+    _ = arena;
+    var child = try std.process.spawn(io, .{ .argv = argv });
+    return child.wait(io);
+}
+
+/// Topologically order services so dependencies precede dependents (best effort;
+/// falls back to declaration order on a cycle).
+fn orderServices(arena: std.mem.Allocator, services: []compose_mod.Service) ![]usize {
+    const n = services.len;
+    var started = try arena.alloc(bool, n);
+    @memset(started, false);
+    var order: std.ArrayListUnmanaged(usize) = .empty;
+    var progress = true;
+    while (order.items.len < n and progress) {
+        progress = false;
+        for (services, 0..) |*s, idx| {
+            if (started[idx]) continue;
+            var ready = true;
+            for (s.depends_on.items) |dep| {
+                // Is the dependency already ordered?
+                var found = false;
+                for (order.items) |oi| {
+                    if (std.mem.eql(u8, services[oi].name, dep)) found = true;
+                }
+                // Only block on deps that actually exist in this compose file.
+                var exists = false;
+                for (services) |*t| if (std.mem.eql(u8, t.name, dep)) {
+                    exists = true;
+                };
+                if (exists and !found) ready = false;
+            }
+            if (ready) {
+                started[idx] = true;
+                try order.append(arena, idx);
+                progress = true;
+            }
+        }
+    }
+    // Cycle fallback: append whatever's left in declaration order.
+    for (0..n) |idx| if (!started[idx]) try order.append(arena, idx);
+    return order.items;
+}
+
+fn findComposeFile(io: std.Io) ?[]const u8 {
+    const candidates = [_][]const u8{ "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml" };
+    for (candidates) |c| {
+        if (std.Io.Dir.cwd().statFile(io, c, .{})) |_| return c else |_| {}
+    }
+    return null;
+}
+
+fn printService(s: *const compose_mod.Service) void {
+    std.debug.print("service {s}:\n", .{s.name});
+    if (s.image) |im| std.debug.print("  image: {s}\n", .{im});
+    if (s.build) |b| std.debug.print("  build: {s}\n", .{b});
+    if (s.command) |c| std.debug.print("  command: {s}\n", .{c});
+    for (s.ports.items) |p| std.debug.print("  port: {s}\n", .{p});
+    for (s.volumes.items) |v| std.debug.print("  volume: {s}\n", .{v});
+    for (s.env.items) |e| std.debug.print("  env: {s}\n", .{e});
+    for (s.depends_on.items) |d| std.debug.print("  depends_on: {s}\n", .{d});
+}
+
+/// Split a command string into whitespace-separated words (no quote handling; the
+/// guest re-parses anyway via the run pipeline's shell quoting).
+fn shellSplit(a: std.mem.Allocator, cmd: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, cmd, " \t");
+    while (it.next()) |w| try list.append(a, try a.dupe(u8, w));
+    return list.toOwnedSlice(a);
+}
+
 fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []const u8) !void {
     var tio = std.Io.Threaded.init(gpa, .{});
     defer tio.deinit();
@@ -1050,7 +1263,12 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
     //      until the arm64 FUSE guest kernel ships (its release kernel has no
     //      CONFIG_VIRTIO_FS), and as an escape hatch on x86.
     if (useVirtiofsRoot()) {
-        const init_path = try std.fmt.allocPrint(arena, "{s}/.contain-init", .{rootfs_dir});
+        // Unique init filename so concurrent guests sharing this cached image rootfs
+        // (e.g. `contain compose up` of two containers off the same image) don't
+        // clobber each other's init file on disk.
+        const guest_init = try std.fmt.allocPrint(arena, "/.contain-init-{x}", .{pidToken()});
+        machine_mod.rootfs_init_path = guest_init;
+        const init_path = try std.fmt.allocPrint(arena, "{s}{s}", .{ rootfs_dir, guest_init });
         try cwd.writeFile(io, .{ .sub_path = init_path, .data = init_script });
         std.debug.print("[contain] rootfs-over-virtiofs: booting '{s}' (demand-paged root, no initramfs)\n", .{opts.image});
         try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, null, rootfs_dir);
@@ -1273,6 +1491,17 @@ fn cmdBuild(gpa: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, cach
 
 fn nullIfEmpty(s: []const u8) ?[]const u8 {
     return if (s.len == 0) null else s;
+}
+
+/// This process's OS process id — a per-process unique token (used to name each
+/// run's guest init file so concurrent guests off one shared image rootfs don't
+/// collide). Each `contain run` is its own process, incl. `compose`'s children.
+fn pidToken() u32 {
+    return switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        .linux => @intCast(std.os.linux.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
 }
 
 /// Wrap a shell-form command string as `["/bin/sh","-c",cmd]` (Docker's CMD/

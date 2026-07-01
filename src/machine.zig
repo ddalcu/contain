@@ -48,6 +48,11 @@ pub const initrd_load: u64 = 0x4800_0000;
 // Interrupt IDs.
 const uart_spi: u32 = 1; // PL011 -> INTID 33
 
+/// The guest init path used with a rootfs-over-virtiofs boot (the kernel `init=`).
+/// Process-global so `contain run` can pick a per-run unique name (concurrent
+/// guests sharing one cached image rootfs must not clobber each other's init file).
+pub var rootfs_init_path: []const u8 = "/.contain-init";
+
 pub const Machine = struct {
     bus: Bus,
     platform: Platform = .arm64_virt,
@@ -340,10 +345,17 @@ pub const Machine = struct {
         // and runs /.contain-init from it. `rootwait` lets the virtio-fs device probe
         // before mount_root. Otherwise boot the initramfs root via rdinit=/init.
         try cmd.appendSlice(alloc, "console=ttyS0 reboot=t panic=-1 pci=off acpi=off");
-        if (rootfs_share != null)
-            try cmd.appendSlice(alloc, " root=rootfs rootfstype=virtiofs rw rootwait init=/.contain-init")
-        else
+        if (rootfs_share != null) {
+            // init= uses rootfs_init_path (default /.contain-init). `contain run`
+            // sets a per-run UNIQUE name so concurrent guests sharing one cached
+            // image rootfs (e.g. `contain compose up`) don't clobber each other's
+            // init file on disk.
+            var ibuf: [160]u8 = undefined;
+            const s = std.fmt.bufPrint(&ibuf, " root=rootfs rootfstype=virtiofs rw rootwait init={s}", .{rootfs_init_path}) catch " root=rootfs rootfstype=virtiofs rw rootwait init=/.contain-init";
+            try cmd.appendSlice(alloc, s);
+        } else {
             try cmd.appendSlice(alloc, " rdinit=/init");
+        }
         // WHP only emulates the LAPIC (no working LAPIC timer for us) and no PIC, so
         // the guest must use the i8254 PIT for the tick: disable the APIC timer,
         // force periodic mode, and skip the IRQ-routing check. KVM has an in-kernel
