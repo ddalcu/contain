@@ -253,7 +253,7 @@ pub const Machine = struct {
     /// scripts try virtiofs then 9p).
     fn addShareDevice(self: *Machine, alloc: std.mem.Allocator, io: std.Io, gic: *Gicv2, slot: u64, irq: u32, path: []const u8, tag: []const u8, force_virtiofs: bool) !?*VirtioFs {
         const win: u64 = if (self.platform == .x86_microvm) x86_virtio_size else VirtioFs.size;
-        if (force_virtiofs or useVirtiofs(alloc)) {
+        if (force_virtiofs or useVirtiofs()) {
             const vfs = try alloc.create(VirtioFs);
             vfs.* = try VirtioFs.init(slot, irq, &self.bus, gic, io, path, tag, alloc);
             try self.bus.addDevice(.{ .base = slot, .size = win, .ctx = vfs, .readFn = vfsRead, .writeFn = vfsWrite, .name = "virtio-fs" });
@@ -266,18 +266,14 @@ pub const Machine = struct {
         return null;
     }
 
-    /// Choose the host-share transport. CONTAIN_SHARE_FS=virtiofs|9p forces it
-    /// (honored on POSIX hosts). Default: virtio-fs on x86 — where contain ships a
-    /// FUSE-enabled guest kernel — and 9p on arm64 until the arm64 FUSE kernel is
-    /// released (the current arm64 release kernel has no CONFIG_VIRTIO_FS).
-    fn useVirtiofs(alloc: std.mem.Allocator) bool {
-        _ = alloc;
-        if (builtin.os.tag != .windows) {
-            if (std.posix.getenv("CONTAIN_SHARE_FS")) |v| {
-                if (std.mem.eql(u8, v, "9p")) return false;
-                if (std.mem.eql(u8, v, "virtiofs")) return true;
-            }
-        }
+    /// Choose the host-share transport. Default: virtio-fs on x86 — where contain
+    /// ships a FUSE-enabled guest kernel — and 9p on arm64 until the arm64 FUSE
+    /// kernel is released (the current arm64 release kernel has no CONFIG_VIRTIO_FS).
+    /// `share_9p_override` (from the caller's env, e.g. CONTAIN_SHARE_FS=9p) forces
+    /// legacy 9p.
+    pub var share_9p_override: bool = false;
+    fn useVirtiofs() bool {
+        if (share_9p_override) return false;
         return builtin.cpu.arch == .x86_64;
     }
 

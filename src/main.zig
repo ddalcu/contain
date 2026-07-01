@@ -293,6 +293,13 @@ pub fn main(init: std.process.Init) !void {
     const accel_override = init.environ_map.get("CONTAIN_ACCEL");
     // CONTAIN_MEM overrides the auto-sized guest RAM (e.g. "4G"); `run -m` beats it.
     const mem_override = init.environ_map.get("CONTAIN_MEM");
+    // CONTAIN_SHARE_FS=9p forces the legacy 9p transport for host-directory shares
+    // (default is virtio-fs on x86). Set the process-wide flag machine.zig reads.
+    if (init.environ_map.get("CONTAIN_SHARE_FS")) |v|
+        machine_mod.Machine.share_9p_override = std.mem.eql(u8, v, "9p");
+    // CONTAIN_ROOTFS=initramfs forces the legacy rootfs-in-initramfs pack instead of
+    // rootfs-over-virtiofs (default on x86). Read here where the env map is available.
+    force_initramfs_root = if (init.environ_map.get("CONTAIN_ROOTFS")) |v| std.mem.eql(u8, v, "initramfs") else false;
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "boot")) {
@@ -1031,17 +1038,15 @@ fn cmdRunOci(gpa: std.mem.Allocator, io: std.Io, opts: RunOpts, cache_base: []co
     try cmdBoot(gpa, io, kernel, null, input, null, opts.volume_host, opts.ports, opts.accel_override, opts.mem, cw.bytes(), null);
 }
 
+/// Set from CONTAIN_ROOTFS=initramfs in main() (where the env map is available).
+var force_initramfs_root: bool = false;
+
 /// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
 /// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
 /// (ships a FUSE guest kernel); arm64 falls back until its FUSE kernel is released.
-/// CONTAIN_ROOTFS=initramfs forces the legacy pack; =virtiofs forces the new path.
+/// CONTAIN_ROOTFS=initramfs forces the legacy pack.
 fn useVirtiofsRoot() bool {
-    if (builtin.os.tag != .windows) {
-        if (std.posix.getenv("CONTAIN_ROOTFS")) |v| {
-            if (std.mem.eql(u8, v, "initramfs")) return false;
-            if (std.mem.eql(u8, v, "virtiofs")) return true;
-        }
-    }
+    if (force_initramfs_root) return false;
     return builtin.cpu.arch == .x86_64;
 }
 
