@@ -129,6 +129,11 @@ const DT_LNK: u32 = 10;
 // FUSE_SETATTR valid bits
 const FATTR_SIZE: u32 = 1 << 3;
 
+// entry/attr cache lifetime advertised to the guest (seconds). Kept short so the
+// guest revalidates: the rootfs is guest-mutable and `-v` shares can change on the
+// host, so long caching would show stale directory/attr state.
+const CACHE_SECS: u64 = 1;
+
 const ROOT_NODEID: u64 = 1;
 
 pub const Node = struct {
@@ -496,7 +501,7 @@ pub const VirtioFs = struct {
         const node = self.nodes.get(nodeid) orelse return r.setErr(ENOENT);
         const a = self.attrOf(node.path) catch return r.setErr(ENOENT);
         var o = r.payload();
-        o.put64(3600); // attr_valid (sec)
+        o.put64(CACHE_SECS); // attr_valid (sec)
         o.put32(0); // attr_valid_nsec
         o.put32(0); // dummy
         self.putAttr(&o, nodeid, a);
@@ -551,7 +556,7 @@ pub const VirtioFs = struct {
         // return the fresh attributes.
         const a = self.attrOf(node.path) catch return r.setErr(ENOENT);
         var o = r.payload();
-        o.put64(3600);
+        o.put64(CACHE_SECS);
         o.put32(0);
         o.put32(0);
         self.putAttr(&o, nodeid, a);
@@ -675,7 +680,26 @@ pub const VirtioFs = struct {
         defer self.alloc.free(src_host);
         const dst_host = self.hostPath(dst);
         std.Io.Dir.cwd().rename(src_host, std.Io.Dir.cwd(), dst_host, self.io) catch |e| return r.setErr(fsErrno(e));
-        if (self.by_path.get(src)) |id| self.dropNode(id);
+        // A FUSE rename keeps the SAME inode (the kernel just moves the dentry), so
+        // we must re-path the node — NOT drop it. Dropping it made a GETATTR on the
+        // moved nodeid return ENOENT, so files installed via temp+rename (apk/dpkg's
+        // atomic install) vanished from the guest's view. If a symlink was recorded
+        // for the old path, move that mapping too.
+        if (self.symlinks.fetchRemove(src)) |kv| {
+            const a = self.dyn.allocator();
+            const nk = a.dupe(u8, dst) catch dst;
+            self.symlinks.put(nk, kv.value) catch {};
+        }
+        if (self.by_path.fetchRemove(dst)) |kv| self.dropNode(kv.value); // overwritten target
+        if (self.by_path.fetchRemove(src)) |kv| {
+            const id = kv.value;
+            if (self.nodes.getPtr(id)) |n| {
+                const newpath = self.alloc.dupe(u8, dst) catch return;
+                self.alloc.free(n.path);
+                n.path = newpath;
+                self.by_path.put(newpath, id) catch {};
+            }
+        }
     }
 
     fn opLink(self: *VirtioFs, oldnodeid_target: u64, body: []const u8, r: *Reply) void {
@@ -939,8 +963,8 @@ pub const VirtioFs = struct {
     fn putEntry(self: *VirtioFs, o: *Payload, nodeid: u64, a: Attr) void {
         o.put64(nodeid); // nodeid
         o.put64(0); // generation
-        o.put64(3600); // entry_valid
-        o.put64(3600); // attr_valid
+        o.put64(CACHE_SECS); // entry_valid
+        o.put64(CACHE_SECS); // attr_valid
         o.put32(0); // entry_valid_nsec
         o.put32(0); // attr_valid_nsec
         self.putAttr(o, nodeid, a); // fuse_attr
