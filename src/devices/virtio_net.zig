@@ -141,6 +141,14 @@ pub const VirtioNet = struct {
         }
     }
 
+    /// Effective size of queue `q`, clamped to the advertised max. Guest-set, so
+    /// it must never be 0 (a `% 0` crashes the host) or exceed the ring bound.
+    inline fn qsize(self: *const VirtioNet, q: usize) u16 {
+        const n = self.qnum[q];
+        if (n == 0 or n > 256) return 0;
+        return @truncate(n);
+    }
+
     const Desc = struct { addr: u64, len: u32, flags: u16, next: u16 };
     fn descAt(self: *VirtioNet, q: usize, idx: u16) Desc {
         const a = self.desc[q] + @as(u64, idx) * 16;
@@ -165,29 +173,39 @@ pub const VirtioNet = struct {
 
     fn processTx(self: *VirtioNet) void {
         const q: usize = 1;
-        if (self.qready[q] == 0 or self.qnum[q] == 0) return;
+        const qn = self.qsize(q);
+        if (self.qready[q] == 0 or qn == 0) return;
         const avail_idx: u16 = @truncate(self.bus.read(self.avail[q] + 2, 2));
         var buf: [2048]u8 = undefined;
         while (self.last_avail[q] != avail_idx) {
-            const slot = self.last_avail[q] % @as(u16, @truncate(self.qnum[q]));
+            const slot = self.last_avail[q] % qn;
             const head: u16 = @truncate(self.bus.read(self.avail[q] + 4 + @as(u64, slot) * 2, 2));
-            // Gather all readable bytes in the chain.
+            // Gather all readable bytes in the chain (walk bounded by qn so a
+            // cyclic guest `next` chain can't spin the host forever).
             var total: usize = 0;
             var idx = head;
-            while (true) {
+            var hops: u16 = 0;
+            while (hops < qn) : (hops += 1) {
+                if (idx >= qn) break;
                 const d = self.descAt(q, idx);
                 if ((d.flags & VRING_DESC_F_WRITE) == 0) {
-                    var i: u32 = 0;
-                    while (i < d.len and total < buf.len) : (i += 1) {
-                        buf[total] = @truncate(self.bus.read(d.addr + i, 1));
-                        total += 1;
+                    const want = @min(@as(usize, d.len), buf.len - total);
+                    if (self.bus.ramSlice(d.addr, want)) |src| {
+                        @memcpy(buf[total..][0..want], src);
+                        total += want;
+                    } else {
+                        var i: u32 = 0;
+                        while (i < d.len and total < buf.len) : (i += 1) {
+                            buf[total] = @truncate(self.bus.read(d.addr + i, 1));
+                            total += 1;
+                        }
                     }
                 }
                 if ((d.flags & VRING_DESC_F_NEXT) == 0) break;
                 idx = d.next;
             }
             if (total > NET_HDR_LEN) self.nat.input(buf[NET_HDR_LEN..total]);
-            self.pushUsed(q, head, 0);
+            self.pushUsed(q, head, 0, qn);
             self.last_avail[q] +%= 1;
         }
         self.raise();
@@ -195,7 +213,8 @@ pub const VirtioNet = struct {
 
     fn deliverRx(self: *VirtioNet) void {
         const q: usize = 0;
-        if (self.qready[q] == 0 or self.qnum[q] == 0) return;
+        const qn = self.qsize(q);
+        if (self.qready[q] == 0 or qn == 0) return;
         var frame: [2048]u8 = undefined;
         var delivered = false;
         while (true) {
@@ -206,32 +225,40 @@ pub const VirtioNet = struct {
             @memset(frame[0..NET_HDR_LEN], 0);
             const total = NET_HDR_LEN + n;
 
-            const slot = self.last_avail[q] % @as(u16, @truncate(self.qnum[q]));
+            const slot = self.last_avail[q] % qn;
             const head: u16 = @truncate(self.bus.read(self.avail[q] + 4 + @as(u64, slot) * 2, 2));
-            // Scatter into writable descriptors.
+            // Scatter into writable descriptors (walk bounded by qn).
             var written: usize = 0;
             var idx = head;
-            while (written < total) {
+            var hops: u16 = 0;
+            while (written < total and hops < qn) : (hops += 1) {
+                if (idx >= qn) break;
                 const d = self.descAt(q, idx);
                 if ((d.flags & VRING_DESC_F_WRITE) != 0) {
-                    var i: u32 = 0;
-                    while (i < d.len and written < total) : (i += 1) {
-                        self.bus.write(d.addr + i, frame[written], 1);
-                        written += 1;
+                    const want = @min(@as(usize, d.len), total - written);
+                    if (self.bus.ramSlice(d.addr, want)) |dst| {
+                        @memcpy(dst, frame[written..][0..want]);
+                        written += want;
+                    } else {
+                        var i: u32 = 0;
+                        while (i < d.len and written < total) : (i += 1) {
+                            self.bus.write(d.addr + i, frame[written], 1);
+                            written += 1;
+                        }
                     }
                 }
                 if ((d.flags & VRING_DESC_F_NEXT) == 0) break;
                 idx = d.next;
             }
-            self.pushUsed(q, head, @intCast(written));
+            self.pushUsed(q, head, @intCast(written), qn);
             self.last_avail[q] +%= 1;
             delivered = true;
         }
         if (delivered) self.raise();
     }
 
-    fn pushUsed(self: *VirtioNet, q: usize, head: u16, len: u32) void {
-        const ring_off = self.used[q] + 4 + @as(u64, self.used_idx[q] % @as(u16, @truncate(self.qnum[q]))) * 8;
+    fn pushUsed(self: *VirtioNet, q: usize, head: u16, len: u32, qn: u16) void {
+        const ring_off = self.used[q] + 4 + @as(u64, self.used_idx[q] % qn) * 8;
         self.bus.write(ring_off, head, 4);
         self.bus.write(ring_off + 4, len, 4);
         self.used_idx[q] +%= 1;

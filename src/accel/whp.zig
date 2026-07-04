@@ -411,7 +411,9 @@ fn runImpl(m: *Machine) !void {
     // IRQ pending), never able to advance. Real progress (IO/MMIO) resets the
     // counter, so only a genuine wedged-with-IRQs-off guest trips it.
     var stuck: u32 = 0;
-    while (running) {
+    // Also honor a cooperative stop from a library embedder (checked each loop
+    // boundary, so it takes effect after the next exit).
+    while (running and !m.stop_requested.load(.acquire)) {
         m.serviceDevicesHw();
         try check(whp.RunVirtualProcessor(partition, 0, &run_ctx, @sizeOf(RunExitContext)), "RunVirtualProcessor");
         switch (run_ctx.exit_reason) {

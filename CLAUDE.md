@@ -261,6 +261,22 @@ built-in kernel.
 - Keep host attack surface minimal: only file I/O (disk/9p) and the NAT's
   outbound sockets. Don't add host capabilities the guest can reach without a
   clear reason.
+- **Untrusted-input invariants (don't regress).** Everything the guest or a
+  pulled image controls is hostile; validate before it touches host memory or
+  the host filesystem:
+  - virtqueue descriptors: bound the chain walk by the queue size, clamp the
+    queue size to `[1, max]` (a `% 0` crashes the host), and range-check guest
+    addresses/lengths (use `Bus.ramSlice`, which is overflow-safe).
+  - 9p/FUSE: the T-message readers (`rd16/32/64`, `rdBytes` in `virtio_9p.zig`)
+    return 0 / empty on a short message instead of slicing OOB; the reply
+    `Writer` bounds-checks; names are single components (reject embedded `/`,
+    `\`, NUL → `error.BadName`) so they can't escape the share.
+  - OCI unpack (`registry.zig`): `safeRelPath` rejects `..`/absolute tar
+    entries, `symlinkEscapes` rejects symlink targets that climb out of the
+    rootfs, and `verifyDigest`/`digestMatches` check every blob against its
+    sha256 before caching/unpacking.
+  - Generated guest init: image/CLI env + workdir are shell-escaped
+    (`shellExportEnv`/`shellQuoteBare` in `main.zig`), argv via `shellQuote`.
 
 ## Gotchas (hard-won — read before debugging)
 

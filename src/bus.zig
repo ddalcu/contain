@@ -51,7 +51,11 @@ pub const Bus = struct {
     }
 
     inline fn inRam(self: *const Bus, addr: u64, sz: u8) bool {
-        return addr >= self.ram_base and addr + sz <= self.ram_base + self.ram.len;
+        // Overflow-safe: `addr + sz` could wrap for a near-2^64 address and
+        // spuriously pass a naive upper-bound check, then index out of bounds.
+        if (addr < self.ram_base) return false;
+        const off = addr - self.ram_base;
+        return sz <= self.ram.len and off <= self.ram.len - sz;
     }
 
     /// Direct RAM pointer for loaders/DMA. Returns null if the range is not
@@ -59,7 +63,8 @@ pub const Bus = struct {
     pub fn ramSlice(self: *Bus, addr: u64, len: usize) ?[]u8 {
         if (addr < self.ram_base) return null;
         const off = addr - self.ram_base;
-        if (off + len > self.ram.len) return null;
+        // Overflow-safe upper bound (see inRam): `off + len` could wrap.
+        if (len > self.ram.len or off > self.ram.len - len) return null;
         return self.ram[off .. off + len];
     }
 
@@ -80,7 +85,7 @@ pub const Bus = struct {
     pub inline fn ramHostPtr(self: *Bus, pa: u64, sz: u8) ?[*]u8 {
         if (pa < self.ram_base) return null;
         const off = pa - self.ram_base;
-        if (off + sz > self.ram.len) return null;
+        if (sz > self.ram.len or off > self.ram.len - sz) return null; // overflow-safe
         return self.ram.ptr + off;
     }
 

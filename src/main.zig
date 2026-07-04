@@ -856,6 +856,29 @@ fn shellQuote(w: *std.Io.Writer, arg: []const u8) !void {
     try w.writeAll("' ");
 }
 
+/// Single-quote `s` (no trailing space) so it is one literal shell word.
+fn shellQuoteBare(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('\'');
+    for (s) |c| {
+        if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
+    }
+    try w.writeByte('\'');
+}
+
+/// Emit `export KEY='VALUE'` from a `KEY=VALUE` string, single-quoting the value
+/// so metacharacters in image/CLI env (`$`, `` ` ``, `"`, spaces, newlines) are
+/// literal instead of executing in the guest init. A bare `KEY` (no `=`) exports
+/// it empty.
+fn shellExportEnv(w: *std.Io.Writer, kv: []const u8) !void {
+    const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
+        try w.print("export {s}=''\n", .{kv});
+        return;
+    };
+    try w.print("export {s}=", .{kv[0..eq]});
+    try shellQuoteBare(w, kv[eq + 1 ..]);
+    try w.writeByte('\n');
+}
+
 pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, overlay_root: bool, epoch: i64) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
@@ -932,11 +955,15 @@ pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: R
     if (opts.volume_host != null)
         try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest, opts.volume_guest });
     // Image env first, then -e/--env (so a user -e overrides the image's value).
-    for (cfg.env) |e| try w.print("export \"{s}\"\n", .{e});
-    for (opts.env) |e| try w.print("export \"{s}\"\n", .{e});
+    for (cfg.env) |e| try shellExportEnv(w, e);
+    for (opts.env) |e| try shellExportEnv(w, e);
     // -w/--workdir overrides the image's WorkingDir.
     const workdir: ?[]const u8 = opts.workdir orelse (if (cfg.working_dir.len != 0) cfg.working_dir else null);
-    if (workdir) |d| try w.print("cd {s} 2>/dev/null\n", .{d});
+    if (workdir) |d| {
+        try w.writeAll("cd ");
+        try shellQuoteBare(w, d);
+        try w.writeAll(" 2>/dev/null\n");
+    }
     // Interactive with no command and no entrypoint override: drop into a shell.
     if (opts.interactive and opts.command.len == 0 and opts.entrypoint == null) {
         try w.writeAll("setsid -c /bin/sh\n");
