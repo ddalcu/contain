@@ -387,7 +387,7 @@ pub const Virtio9p = struct {
         while (i < nwname) : (i += 1) {
             const nlen = rd16(t, off);
             off += 2;
-            const name = t[off .. off + nlen];
+            const name = rdBytes(t, off, nlen);
             off += nlen;
             const joined = try self.joinPath(path, name);
             self.alloc.free(path);
@@ -405,7 +405,7 @@ pub const Virtio9p = struct {
         // fid[4] name[s] flags[4] mode[4] gid[4]; fid becomes the new file.
         const fid = rd32(t, 7);
         const nlen = rd16(t, 11);
-        const name = t[13 .. 13 + nlen];
+        const name = rdBytes(t, 13, nlen);
         const parent = self.fids.get(fid) orelse return self.lerror(w, 9);
         const child = try self.joinPath(parent.path, name);
         defer self.alloc.free(child);
@@ -439,7 +439,7 @@ pub const Virtio9p = struct {
         // dfid[4] name[s] mode[4] gid[4] -> Rmkdir qid[13]
         const dfid = rd32(t, 7);
         const nlen = rd16(t, 11);
-        const name = t[13 .. 13 + nlen];
+        const name = rdBytes(t, 13, nlen);
         const parent = self.fids.get(dfid) orelse return self.lerror(w, 9);
         const child = try self.joinPath(parent.path, name);
         defer self.alloc.free(child);
@@ -456,7 +456,7 @@ pub const Virtio9p = struct {
     fn doUnlinkat(self: *Virtio9p, t: []const u8, w: *Writer) !u8 {
         const dfid = rd32(t, 7);
         const nlen = rd16(t, 11);
-        const name = t[13 .. 13 + nlen];
+        const name = rdBytes(t, 13, nlen);
         const flags = rd32(t, 13 + nlen);
         const parent = self.fids.get(dfid) orelse return self.lerror(w, 9);
         const child = try self.joinPath(parent.path, name);
@@ -476,7 +476,7 @@ pub const Virtio9p = struct {
         const f = self.fids.getPtr(rd32(t, 7)) orelse return self.lerror(w, 9);
         const parent = self.fids.get(rd32(t, 11)) orelse return self.lerror(w, 9);
         const nlen = rd16(t, 15);
-        const name = t[17 .. 17 + nlen];
+        const name = rdBytes(t, 17, nlen);
         const dst_rel = try self.joinPath(parent.path, name);
         defer self.alloc.free(dst_rel);
         // hostPath reuses one scratch buffer, so snapshot the source before building
@@ -499,13 +499,13 @@ pub const Virtio9p = struct {
         off += 4;
         const onlen = rd16(t, off);
         off += 2;
-        const oldname = t[off .. off + onlen];
+        const oldname = rdBytes(t, off, onlen);
         off += onlen;
         const newdir = self.fids.get(rd32(t, off)) orelse return self.lerror(w, 9);
         off += 4;
         const nnlen = rd16(t, off);
         off += 2;
-        const newname = t[off .. off + nnlen];
+        const newname = rdBytes(t, off, nnlen);
         const src_rel = try self.joinPath(olddir.path, oldname);
         defer self.alloc.free(src_rel);
         const dst_rel = try self.joinPath(newdir.path, newname);
@@ -521,11 +521,11 @@ pub const Virtio9p = struct {
         // fid[4] name[s] symtgt[s] gid[4] -> Rsymlink qid[13]
         const fid = rd32(t, 7);
         const nlen = rd16(t, 11);
-        const name = t[13 .. 13 + nlen];
+        const name = rdBytes(t, 13, nlen);
         var off: usize = 13 + nlen;
         const tlen = rd16(t, off);
         off += 2;
-        const target = t[off .. off + tlen];
+        const target = rdBytes(t, off, tlen);
         const parent = self.fids.get(fid) orelse return self.lerror(w, 9);
         const child = try self.joinPath(parent.path, name);
         defer self.alloc.free(child);
@@ -567,7 +567,9 @@ pub const Virtio9p = struct {
             const q = self.qidFor(child) catch Qid{ .qtype = QTFILE, .version = 0, .path = 0 };
             // entry: qid[13] offset[8] type[1] name[s]
             const entry_size: u32 = 13 + 8 + 1 + 2 + @as(u32, @intCast(e.name.len));
-            if (data_len + entry_size > count) break;
+            // Stop on the guest's requested count OR the real reply-buffer bound,
+            // whichever comes first (count is guest-controlled).
+            if (data_len + entry_size > count or w.pos + entry_size > w.buf.len) break;
             w.putQid(q);
             w.put64(entry_index + 1); // next offset
             w.put8(if (q.qtype == QTDIR) 4 else 8); // d_type (DT_DIR/DT_REG)
@@ -586,9 +588,13 @@ pub const Virtio9p = struct {
         const f = self.fids.get(fid) orelse return self.lerror(w, 9);
         var file = std.Io.Dir.cwd().openFile(self.io, self.hostPath(f.path), .{}) catch return self.lerror(w, 2);
         defer file.close(self.io);
-        const want = @min(count, 8000);
         const count_pos = w.pos;
         w.put32(0); // placeholder
+        // Cap the read to what actually fits in the reply buffer (msize is
+        // negotiated to 8 KiB, but honor the real buffer bound regardless of the
+        // guest-supplied count).
+        const avail = if (w.buf.len > w.pos) w.buf.len - w.pos else 0;
+        const want = @min(@as(usize, count), avail);
         const n = file.readPositionalAll(self.io, w.buf[w.pos .. w.pos + want], offset) catch return self.lerror(w, 5);
         w.pos += n;
         std.mem.writeInt(u32, w.buf[count_pos .. count_pos + 4][0..4], @intCast(n), .little);
@@ -599,12 +605,16 @@ pub const Virtio9p = struct {
         const fid = rd32(t, 7);
         const offset = rd64(t, 11);
         const count = rd32(t, 19);
-        const data = t[23 .. 23 + count];
+        // `count` is guest-controlled; clamp the payload slice to the bytes that
+        // actually arrived in the T-message (else this slices out of bounds).
+        if (23 > t.len) return self.lerror(w, 22); // EINVAL: truncated header
+        const avail = t.len - 23;
+        const data = t[23 .. 23 + @min(@as(usize, count), avail)];
         const f = self.fids.get(fid) orelse return self.lerror(w, 9);
         var file = std.Io.Dir.cwd().openFile(self.io, self.hostPath(f.path), .{ .mode = .read_write }) catch return self.lerror(w, 13);
         defer file.close(self.io);
         file.writePositionalAll(self.io, data, offset) catch return self.lerror(w, 5);
-        w.put32(count);
+        w.put32(@intCast(data.len));
         return Twrite + 1;
     }
 
@@ -634,6 +644,11 @@ pub const Virtio9p = struct {
             const slash = std.mem.lastIndexOfScalar(u8, base, '/');
             return self.alloc.dupe(u8, if (slash) |s| base[0..s] else "");
         }
+        // A 9p walk name is a single path component. Reject anything with an
+        // embedded separator or NUL so a crafted name (e.g. "a/../../etc") can't
+        // escape the shared directory on the host filesystem (sandbox break).
+        if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\\x00") != null)
+            return error.BadName;
         if (base.len == 0) return self.alloc.dupe(u8, name);
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ base, name });
     }
@@ -678,39 +693,71 @@ pub const Virtio9p = struct {
     }
 };
 
-// Little-endian readers over the T-message buffer.
+// Little-endian readers over the T-message buffer. The buffer is filled from
+// guest-controlled descriptors, so a short/truncated message must not slice out
+// of bounds (which would panic and abort the host). Reading past the end yields
+// 0 — the handler then hits an unknown fid / empty name and returns an Rlerror.
 fn rd16(b: []const u8, off: usize) u16 {
+    if (off + 2 > b.len) return 0;
     return std.mem.readInt(u16, b[off .. off + 2][0..2], .little);
 }
 fn rd32(b: []const u8, off: usize) u32 {
+    if (off + 4 > b.len) return 0;
     return std.mem.readInt(u32, b[off .. off + 4][0..4], .little);
 }
 fn rd64(b: []const u8, off: usize) u64 {
+    if (off + 8 > b.len) return 0;
     return std.mem.readInt(u64, b[off .. off + 8][0..8], .little);
+}
+/// Bounds-safe slice of `len` bytes at `off` in a guest-supplied message.
+/// Returns an empty slice if the range runs past the buffer (a truncated /
+/// malicious message), so name/data extraction never slices out of bounds.
+fn rdBytes(b: []const u8, off: usize, len: usize) []const u8 {
+    if (off > b.len or len > b.len - off) return b[0..0];
+    return b[off .. off + len];
 }
 
 const Writer = struct {
     buf: []u8,
     pos: usize,
+    // Set once a put would exceed `buf`; further puts are dropped. The reply
+    // buffer is fixed (16 KiB) and readdir's loop bound uses a guest-supplied
+    // count, so without this a large directory + large `count` could scribble
+    // past the buffer (a stack-buffer overflow). Callers that loop should check
+    // `overflow` to stop early; the rest degrade to a truncated (but in-bounds)
+    // reply.
+    overflow: bool = false,
 
+    inline fn room(self: *Writer, n: usize) bool {
+        if (self.pos + n > self.buf.len) {
+            self.overflow = true;
+            return false;
+        }
+        return true;
+    }
     fn put8(self: *Writer, v: u8) void {
+        if (!self.room(1)) return;
         self.buf[self.pos] = v;
         self.pos += 1;
     }
     fn put16(self: *Writer, v: u16) void {
+        if (!self.room(2)) return;
         std.mem.writeInt(u16, self.buf[self.pos .. self.pos + 2][0..2], v, .little);
         self.pos += 2;
     }
     fn put32(self: *Writer, v: u32) void {
+        if (!self.room(4)) return;
         std.mem.writeInt(u32, self.buf[self.pos .. self.pos + 4][0..4], v, .little);
         self.pos += 4;
     }
     fn put64(self: *Writer, v: u64) void {
+        if (!self.room(8)) return;
         std.mem.writeInt(u64, self.buf[self.pos .. self.pos + 8][0..8], v, .little);
         self.pos += 8;
     }
     fn putStr(self: *Writer, s: []const u8) void {
         self.put16(@intCast(s.len));
+        if (!self.room(s.len)) return;
         @memcpy(self.buf[self.pos .. self.pos + s.len], s);
         self.pos += s.len;
     }

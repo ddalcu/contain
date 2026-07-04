@@ -8,6 +8,7 @@
 //!   used    : device -> driver used ring
 //! The device reads physical guest memory through the Bus.
 
+const std = @import("std");
 const Bus = @import("../bus.zig").Bus;
 const Gicv2 = @import("gicv2.zig").Gicv2;
 
@@ -117,12 +118,22 @@ pub const VirtioBlk = struct {
         }
     }
 
+    /// Effective queue size, clamped to the advertised max. Guest-controlled, so
+    /// it must never be zero (a `% 0` would crash the host) or exceed the ring.
+    inline fn qsize(self: *const VirtioBlk) u16 {
+        const n = self.queue_num;
+        if (n == 0 or n > 256) return 0;
+        return @truncate(n);
+    }
+
     fn processQueue(self: *VirtioBlk) void {
+        const qn = self.qsize();
+        if (self.queue_ready == 0 or qn == 0) return; // not set up by the guest yet
         const avail_idx = self.bus.read(self.avail_addr + 2, 2); // avail.idx
         while (self.last_avail != @as(u16, @truncate(avail_idx))) {
-            const ring_slot = self.last_avail % @as(u16, @truncate(self.queue_num));
+            const ring_slot = self.last_avail % qn;
             const head: u16 = @truncate(self.bus.read(self.avail_addr + 4 + @as(u64, ring_slot) * 2, 2));
-            self.handleChain(head);
+            self.handleChain(head, qn);
             self.last_avail +%= 1;
         }
         // Raise used-buffer-notification interrupt.
@@ -130,26 +141,30 @@ pub const VirtioBlk = struct {
         self.gic.setIrq(self.irq_id, true);
     }
 
-    /// Walk a descriptor chain: [req header (RO)] [data (RO for write / WO for read)] [status byte (WO)].
-    fn handleChain(self: *VirtioBlk, head: u16) void {
+    /// Walk a descriptor chain: [req header (RO)] [data...] [status byte (WO)].
+    /// Parsed positionally per the virtio spec: descriptor 0 is the header, the
+    /// final 1-byte writable descriptor is the status, and a writable descriptor
+    /// in between is the data buffer. The walk is bounded by `qn` so a guest
+    /// cannot spin the host with a cyclic `next` chain.
+    fn handleChain(self: *VirtioBlk, head: u16, qn: u16) void {
         var idx = head;
         var hdr_addr: u64 = 0;
         var data_addr: u64 = 0;
         var data_len: u64 = 0;
         var status_addr: u64 = 0;
         var part: u32 = 0;
-        while (true) {
+        var hops: u16 = 0;
+        while (hops < qn) : (hops += 1) {
+            if (idx >= qn) break; // out-of-range descriptor index
             const d = self.descAt(idx);
             if (part == 0) {
                 hdr_addr = d.addr;
-            } else if ((d.flags & VRING_DESC_F_NEXT) != 0 or (d.flags & VRING_DESC_F_WRITE) != 0 and status_addr == 0 and data_addr == 0) {
-                // middle data descriptor (could be the data buffer)
-                if (d.len == 1) status_addr = d.addr else {
-                    data_addr = d.addr;
-                    data_len = d.len;
-                }
+            } else if (d.len == 1 and (d.flags & VRING_DESC_F_WRITE) != 0) {
+                status_addr = d.addr; // status byte
+            } else if (data_addr == 0) {
+                data_addr = d.addr; // first data segment
+                data_len = d.len;
             }
-            if (d.len == 1 and (d.flags & VRING_DESC_F_WRITE) != 0) status_addr = d.addr;
             if ((d.flags & VRING_DESC_F_NEXT) == 0) break;
             idx = d.next;
             part += 1;
@@ -157,24 +172,37 @@ pub const VirtioBlk = struct {
 
         const req_type: u32 = @truncate(self.bus.read(hdr_addr, 4));
         const sector = self.bus.read(hdr_addr + 8, 8);
-        const offset = sector * SECTOR;
+        // sector * 512 can overflow a u64 for absurd guest values; a checked mul
+        // maps that to a failed request instead of a host panic / silent wrap.
         var ok: u8 = 0;
-        if (req_type == BLK_T_IN) { // device writes data to guest
-            if (offset + data_len <= self.disk.len) {
-                var i: u64 = 0;
-                while (i < data_len) : (i += 1) self.bus.write(data_addr + i, self.disk[offset + i], 1);
-            } else ok = 1;
-        } else if (req_type == BLK_T_OUT) { // guest data -> disk
-            if (offset + data_len <= self.disk.len) {
-                var i: u64 = 0;
-                while (i < data_len) : (i += 1) self.disk[offset + i] = @truncate(self.bus.read(data_addr + i, 1));
-            } else ok = 1;
-        }
+        const offset: u64 = std.math.mul(u64, sector, SECTOR) catch blk: {
+            ok = 1;
+            break :blk self.disk.len + 1; // force the bounds check below to fail
+        };
+        const in_bounds = offset <= self.disk.len and data_len <= self.disk.len - offset;
+        if (ok == 0 and in_bounds) {
+            const disk_slice = self.disk[offset..][0..data_len];
+            if (req_type == BLK_T_IN) { // device writes data to guest
+                if (self.bus.ramSlice(data_addr, data_len)) |dst| {
+                    @memcpy(dst, disk_slice);
+                } else {
+                    var i: u64 = 0;
+                    while (i < data_len) : (i += 1) self.bus.write(data_addr + i, disk_slice[i], 1);
+                }
+            } else if (req_type == BLK_T_OUT) { // guest data -> disk
+                if (self.bus.ramSlice(data_addr, data_len)) |src| {
+                    @memcpy(disk_slice, src);
+                } else {
+                    var i: u64 = 0;
+                    while (i < data_len) : (i += 1) disk_slice[i] = @truncate(self.bus.read(data_addr + i, 1));
+                }
+            }
+        } else ok = 1;
         if (status_addr != 0) self.bus.write(status_addr, ok, 1); // 0 = VIRTIO_BLK_S_OK
 
         // Add to used ring.
-        const total_written: u32 = if (req_type == BLK_T_IN) @truncate(data_len + 1) else 1;
-        const ring_off = self.used_addr + 4 + @as(u64, self.used_idx % @as(u16, @truncate(self.queue_num))) * 8;
+        const total_written: u32 = if (req_type == BLK_T_IN and ok == 0) @truncate(data_len + 1) else 1;
+        const ring_off = self.used_addr + 4 + @as(u64, self.used_idx % qn) * 8;
         self.bus.write(ring_off, head, 4); // used elem id
         self.bus.write(ring_off + 4, total_written, 4); // len
         self.used_idx +%= 1;

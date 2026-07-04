@@ -923,6 +923,11 @@ pub const VirtioFs = struct {
             const slash = std.mem.lastIndexOfScalar(u8, p.path, '/');
             return self.alloc.dupe(u8, if (slash) |s| p.path[0..s] else "");
         }
+        // A FUSE LOOKUP name is a single component. Reject an embedded separator
+        // or NUL so a crafted name can't traverse out of the shared directory on
+        // the host filesystem (sandbox break).
+        if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\\x00") != null)
+            return error.BadName;
         if (p.path.len == 0) return self.alloc.dupe(u8, name);
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ p.path, name });
     }

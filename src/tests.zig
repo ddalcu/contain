@@ -8,6 +8,8 @@ const Pl011 = @import("devices/uart_pl011.zig").Pl011;
 const Machine = @import("machine.zig").Machine;
 const pvh = @import("x86/pvh.zig");
 const nat = @import("net/nat.zig");
+const Bus = @import("bus.zig").Bus;
+const VirtioBlk = @import("devices/virtio.zig").VirtioBlk;
 
 const ram_base: u64 = 0x4000_0000;
 
@@ -865,6 +867,67 @@ test "oci: imageArchFromConfig reads the config architecture (guards wrong-arch 
     // rejects on a definite mismatch).
     try std.testing.expect(registry.imageArchFromConfig(a, "{\"os\":\"linux\"}") == null);
     try std.testing.expect(registry.imageArchFromConfig(a, "not json") == null);
+}
+
+test "virtio-blk: a hostile queue size can't crash the host (no divide-by-zero)" {
+    const a = std.testing.allocator;
+    var bus = try Bus.init(a, ram_base, 64 * 1024);
+    defer bus.deinit();
+    var irq = IrqLine{};
+    var gic = Gicv2.init(&irq);
+    var disk = [_]u8{0} ** 512;
+    var blk = VirtioBlk.init(0x1000_0000, 3, &bus, &gic, &disk);
+
+    // QUEUE_NUM offset 0x038, QUEUE_READY 0x044, QUEUE_NOTIFY 0x050.
+    // NOTIFY with queue never made ready / size 0 must be a no-op, not a crash.
+    blk.write(0x050, 0, 4);
+    blk.write(0x044, 1, 4); // ready, but queue_num still 0
+    blk.write(0x050, 0, 4);
+    // A queue size whose u16 truncation is 0 (0x10000) must also be rejected.
+    blk.write(0x038, 0x10000, 4);
+    blk.write(0x050, 0, 4);
+    // Oversized (> advertised max) is clamped away too.
+    blk.write(0x038, 0xffff_ffff, 4);
+    blk.write(0x050, 0, 4);
+}
+
+test "oci: safeRelPath rejects traversal + absolute layer entries" {
+    // Safe, normal image paths.
+    try std.testing.expect(registry.safeRelPath("usr/bin/node"));
+    try std.testing.expect(registry.safeRelPath("etc/hosts"));
+    // Escapes: absolute, leading/interior/plain `..`.
+    try std.testing.expect(!registry.safeRelPath("/etc/passwd"));
+    try std.testing.expect(!registry.safeRelPath("..\\evil"));
+    try std.testing.expect(!registry.safeRelPath("../../etc/passwd"));
+    try std.testing.expect(!registry.safeRelPath("app/../../../home/user/.bashrc"));
+    try std.testing.expect(!registry.safeRelPath(""));
+}
+
+test "oci: symlinkEscapes rejects only symlinks that climb out of the rootfs" {
+    // Absolute target always escapes.
+    try std.testing.expect(registry.symlinkEscapes("pwn", "/home/user"));
+    // Relative target that climbs above root escapes.
+    try std.testing.expect(registry.symlinkEscapes("x", "../../../etc"));
+    // Legitimate in-tree relative links (common in real images) are allowed.
+    try std.testing.expect(!registry.symlinkEscapes("usr/lib/libssl.so", "libssl.so.3"));
+    try std.testing.expect(!registry.symlinkEscapes("usr/bin/x", "../lib/y"));
+    try std.testing.expect(!registry.symlinkEscapes("a/b/c", "../../d"));
+    // One level too deep from a/b/c (3 comps -> parent depth 2; ../../../ = -1).
+    try std.testing.expect(registry.symlinkEscapes("a/b/c", "../../../d"));
+}
+
+test "oci: digestMatches verifies sha256 and passes unknown algos" {
+    const data = "hello contain";
+    var sum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &sum, .{});
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{&sum});
+    const good = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
+    defer std.testing.allocator.free(good);
+    try std.testing.expect(registry.digestMatches(data, good));
+    try std.testing.expect(!registry.digestMatches("tampered", good));
+    // Non-sha256 digests can't be verified here → accepted as-is.
+    try std.testing.expect(registry.digestMatches(data, "sha512:whatever"));
 }
 
 // --- virtio-9p advisory locking (9P2000.L Tlock/Tgetlock) ------------------

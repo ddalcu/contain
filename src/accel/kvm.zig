@@ -365,7 +365,9 @@ fn runImplArm64(m: *Machine) !void {
     try setOneReg(vcpu_fd, REG_PSTATE, PSTATE_EL1H_DAIF);
 
     var running = true;
-    while (running) {
+    // Also honor a cooperative stop from a library embedder (requestStop sets
+    // this); checked each loop boundary, so it takes effect after the next exit.
+    while (running and !m.stop_requested.load(.acquire)) {
         // Console input + UART line + NAT pump/RX. setIrq here injects via KVM.
         m.serviceDevicesHw();
 
@@ -509,7 +511,7 @@ fn runImplX86(m: *Machine) !void {
 
     var running = true;
     var stuck: u32 = 0; // consecutive IF=0 observations with no IO/MMIO progress
-    while (running) {
+    while (running and !m.stop_requested.load(.acquire)) {
         m.serviceDevicesHw();
         const rc = std.os.linux.ioctl(vcpu_fd, KVM_RUN, 0);
         if (@as(isize, @bitCast(rc)) < 0) {

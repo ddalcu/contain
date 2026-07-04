@@ -258,23 +258,57 @@ const max_blob_bytes: usize = 4 * 1024 * 1024 * 1024;
 /// hit is always valid. The write goes via a ".part" temp + rename so a killed run
 /// never leaves a truncated blob to be served later.
 fn getBlob(client: *http.Client, gpa: std.mem.Allocator, io: std.Io, url: []const u8, token: ?[]const u8, cache_dir: ?[]const u8, digest: []const u8) ![]u8 {
-    const cd = cache_dir orelse return httpGet(client, gpa, url, null, token);
+    const cd = cache_dir orelse {
+        const data = try httpGet(client, gpa, url, null, token);
+        errdefer gpa.free(data);
+        try verifyDigest(data, digest);
+        return data;
+    };
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, cd) catch {};
     const path = try blobPath(gpa, cd, digest);
     defer gpa.free(path);
     if (cwd.readFileAlloc(io, path, gpa, .limited(max_blob_bytes))) |data| {
-        std.debug.print("[oci] cache hit {s}\n", .{digest[0..@min(19, digest.len)]});
-        return data;
+        // A blob is content-addressed by its sha256; verify the cached bytes
+        // actually hash to `digest` before trusting them (a poisoned/corrupt
+        // cache entry must not be served). On mismatch, drop it and re-fetch.
+        if (digestMatches(data, digest)) {
+            std.debug.print("[oci] cache hit {s}\n", .{digest[0..@min(19, digest.len)]});
+            return data;
+        }
+        gpa.free(data);
+        std.debug.print("[oci] cache entry {s} failed digest check; re-fetching\n", .{digest[0..@min(19, digest.len)]});
+        cwd.deleteFile(io, path) catch {};
     } else |_| {}
     const data = try httpGet(client, gpa, url, null, token);
     errdefer gpa.free(data);
+    // Verify the downloaded bytes against their advertised digest before caching
+    // or unpacking them (guards a compromised/buggy registry or MITM).
+    try verifyDigest(data, digest);
     const part = try std.fmt.allocPrint(gpa, "{s}.part", .{path});
     defer gpa.free(part);
     if (cwd.writeFile(io, .{ .sub_path = part, .data = data })) |_| {
         cwd.rename(part, cwd, path, io) catch cwd.deleteFile(io, part) catch {};
     } else |_| {}
     return data;
+}
+
+/// True if `data` hashes to `digest` (format `sha256:<hex>`). Non-sha256
+/// algorithms are accepted as-is (not verifiable here) rather than rejected.
+pub fn digestMatches(data: []const u8, digest: []const u8) bool {
+    const prefix = "sha256:";
+    if (!std.mem.startsWith(u8, digest, prefix)) return true; // unknown algo, can't verify
+    const want_hex = digest[prefix.len..];
+    if (want_hex.len != 64) return false;
+    var sum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &sum, .{});
+    var got_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&got_hex, "{x}", .{&sum}) catch return false;
+    return std.ascii.eqlIgnoreCase(&got_hex, want_hex);
+}
+
+fn verifyDigest(data: []const u8, digest: []const u8) !void {
+    if (!digestMatches(data, digest)) return error.DigestMismatch;
 }
 
 /// A blob's on-disk cache path: `<cache_dir>/<digest with ':' and '/' -> '-'>`.
@@ -356,6 +390,48 @@ fn dupStrArray(arena: std.mem.Allocator, v: std.json.Value) ![]const []const u8 
     return out;
 }
 
+/// Reject a tar entry path that would escape the destination directory. The
+/// bytes come from an untrusted image, so a name like `a/../../../etc/passwd`
+/// or an absolute `/etc/passwd` must never reach `openat`-relative host ops
+/// (the kernel resolves `..`, so the write lands outside the rootfs cache).
+/// Returns true if `path` is safe: relative, and no component is `..`.
+pub fn safeRelPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/' or path[0] == '\\') return false; // absolute
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |c| {
+        if (std.mem.eql(u8, c, "..")) return false;
+    }
+    return true;
+}
+
+/// True if a symlink at `link_path` pointing at `target` would resolve outside
+/// the rootfs. Absolute targets always escape; relative ones are walked
+/// lexically from the link's own directory and escape if `..` ever climbs above
+/// the root. Since file/dir entry paths are already `..`-free (safeRelPath),
+/// rejecting escaping symlink targets closes the create-symlink-then-write-
+/// through-it host-file escape while still allowing normal in-tree `../lib/x`
+/// links that real images use.
+pub fn symlinkEscapes(link_path: []const u8, target: []const u8) bool {
+    if (target.len == 0) return true;
+    if (target[0] == '/' or target[0] == '\\') return true; // absolute
+    // Depth of the link's parent directory below root.
+    var depth: isize = 0;
+    var base_it = std.mem.splitAny(u8, link_path, "/\\");
+    var n: usize = 0;
+    while (base_it.next()) |_| n += 1;
+    if (n > 0) depth = @intCast(n - 1); // drop the link's own basename
+    var it = std.mem.splitAny(u8, target, "/\\");
+    while (it.next()) |c| {
+        if (c.len == 0 or std.mem.eql(u8, c, ".")) continue;
+        if (std.mem.eql(u8, c, "..")) {
+            depth -= 1;
+            if (depth < 0) return true; // climbed above the rootfs root
+        } else depth += 1;
+    }
+    return false;
+}
+
 /// Unpack one gzip'd-tar layer over `root`, applying `.wh.` whiteouts.
 fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []const u8, window: []u8) !void {
     var in = std.Io.Reader.fixed(gz);
@@ -385,6 +461,12 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
     while (try iter.next()) |entry| {
         const path = std.mem.trimStart(u8, entry.name, "./");
         if (path.len == 0) continue;
+        // Guard against a malicious image escaping the rootfs dir via `..` or an
+        // absolute path (std.tar.Iterator does no sanitization of its own).
+        if (!safeRelPath(path)) {
+            std.debug.print("[oci] skipping unsafe layer entry: {s}\n", .{entry.name});
+            continue;
+        }
         const base = std.fs.path.basename(path);
 
         // Overlay whiteouts: ".wh.<name>" deletes <name>; ".wh..wh..opq" clears a dir.
@@ -396,7 +478,9 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
                 else
                     try gpa.dupe(u8, base[".wh.".len..]);
                 defer gpa.free(target);
-                root.deleteTree(io, target) catch {};
+                // parent is already validated; the deleted name is a single
+                // basename component, so the join can't traverse — but guard anyway.
+                if (safeRelPath(target)) root.deleteTree(io, target) catch {};
             }
             continue;
         }
@@ -404,6 +488,10 @@ fn extractLayer(io: std.Io, root: std.Io.Dir, gpa: std.mem.Allocator, gz: []cons
         switch (entry.kind) {
             .directory => root.createDirPath(io, path) catch {},
             .sym_link => {
+                if (symlinkEscapes(path, entry.link_name)) {
+                    std.debug.print("[oci] skipping escaping symlink {s} -> {s}\n", .{ path, entry.link_name });
+                    continue;
+                }
                 if (std.fs.path.dirname(path)) |d| root.createDirPath(io, d) catch {};
                 root.deleteFile(io, path) catch {};
                 root.symLink(io, entry.link_name, path, .{}) catch {};

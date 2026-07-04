@@ -779,6 +779,19 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     var m = try Machine.init(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*); // networking on
     defer m.deinit();
 
+    // Build the kernel command line. With a rootfs-over-virtiofs boot the kernel
+    // mounts the host rootfs dir as its real root (demand-paged) via
+    // `root=rootfs rootfstype=virtiofs` + the per-run `init=`; otherwise the rootfs
+    // rides in the initramfs and we `rdinit=/init`. (Mirrors initX86's cmdline.)
+    var argbuf: [256]u8 = undefined;
+    const bootargs: []const u8 = if (rootfs_share != null) blk: {
+        const extra = if (interactive) " contain.interactive" else "";
+        break :blk std.fmt.bufPrint(&argbuf, "console=ttyAMA0 earlycon=pl011,0x9000000 root=rootfs rootfstype=virtiofs rw rootwait init={s}{s} panic=-1", .{ machine_mod.rootfs_init_path, extra }) catch "console=ttyAMA0 earlycon=pl011,0x9000000 root=rootfs rootfstype=virtiofs rw rootwait init=/.contain-init panic=-1";
+    } else if (interactive)
+        "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive panic=-1"
+    else
+        "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1";
+
     const dtb = try fdt.buildVirtDtb(gpa, .{
         .ram_base = machine_mod.ram_base,
         .ram_size = ram_size,
@@ -788,10 +801,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
         // panic=-1: on any kernel panic (e.g. an image with no /bin/sh, so /init
         // can't exec) reboot immediately -> PSCI SYSTEM_RESET -> the run loop exits
         // cleanly instead of the vCPU spinning forever with no way out.
-        .bootargs = if (interactive)
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive panic=-1"
-        else
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1",
+        .bootargs = bootargs,
         .initrd_start = if (initrd != null) initrd_start else null,
         .initrd_end = initrd_end,
         .num_virtio = m.num_virtio,
@@ -854,6 +864,29 @@ fn shellQuote(w: *std.Io.Writer, arg: []const u8) !void {
         if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
     }
     try w.writeAll("' ");
+}
+
+/// Single-quote `s` (no trailing space) so it is one literal shell word.
+fn shellQuoteBare(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('\'');
+    for (s) |c| {
+        if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
+    }
+    try w.writeByte('\'');
+}
+
+/// Emit `export KEY='VALUE'` from a `KEY=VALUE` string, single-quoting the value
+/// so metacharacters in image/CLI env (`$`, `` ` ``, `"`, spaces, newlines) are
+/// literal instead of executing in the guest init. A bare `KEY` (no `=`) exports
+/// it empty.
+fn shellExportEnv(w: *std.Io.Writer, kv: []const u8) !void {
+    const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
+        try w.print("export {s}=''\n", .{kv});
+        return;
+    };
+    try w.print("export {s}=", .{kv[0..eq]});
+    try shellQuoteBare(w, kv[eq + 1 ..]);
+    try w.writeByte('\n');
 }
 
 pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: RunOpts, overlay_root: bool, epoch: i64) ![]const u8 {
@@ -932,11 +965,15 @@ pub fn buildOciInit(arena: std.mem.Allocator, cfg: registry.ImageConfig, opts: R
     if (opts.volume_host != null)
         try w.print("mkdir -p {s} 2>/dev/null\nmount -t virtiofs host {s} 2>/dev/null || mount -t 9p -o trans=virtio,version=9p2000.L host {s} 2>/dev/null\n", .{ opts.volume_guest, opts.volume_guest, opts.volume_guest });
     // Image env first, then -e/--env (so a user -e overrides the image's value).
-    for (cfg.env) |e| try w.print("export \"{s}\"\n", .{e});
-    for (opts.env) |e| try w.print("export \"{s}\"\n", .{e});
+    for (cfg.env) |e| try shellExportEnv(w, e);
+    for (opts.env) |e| try shellExportEnv(w, e);
     // -w/--workdir overrides the image's WorkingDir.
     const workdir: ?[]const u8 = opts.workdir orelse (if (cfg.working_dir.len != 0) cfg.working_dir else null);
-    if (workdir) |d| try w.print("cd {s} 2>/dev/null\n", .{d});
+    if (workdir) |d| {
+        try w.writeAll("cd ");
+        try shellQuoteBare(w, d);
+        try w.writeAll(" 2>/dev/null\n");
+    }
     // Interactive with no command and no entrypoint override: drop into a shell.
     if (opts.interactive and opts.command.len == 0 and opts.entrypoint == null) {
         try w.writeAll("setsid -c /bin/sh\n");
@@ -1533,12 +1570,12 @@ var force_initramfs_root: bool = false;
 var overlay_isolation: bool = true;
 
 /// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
-/// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
-/// (ships a FUSE guest kernel); arm64 falls back until its FUSE kernel is released.
-/// CONTAIN_ROOTFS=initramfs forces the legacy pack.
+/// memory-lean) vs. packing it into an in-RAM initramfs. Default on both arches
+/// now that the guest kernels (x86 and arm64) both ship CONFIG_VIRTIO_FS
+/// (tools/build_kernel.sh). CONTAIN_ROOTFS=initramfs forces the legacy pack (the
+/// escape hatch for an older fetched kernel without FUSE).
 fn useVirtiofsRoot() bool {
-    if (force_initramfs_root) return false;
-    return builtin.cpu.arch == .x86_64;
+    return !force_initramfs_root;
 }
 
 /// Accumulated build state -> the output image config.

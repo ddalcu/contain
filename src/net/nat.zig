@@ -187,6 +187,7 @@ pub const Nat = struct {
     guest_mac: [6]u8,
     have_guest_mac: bool = false,
     rx: std.ArrayListUnmanaged(Frame) = .empty,
+    rx_head: usize = 0, // index of the next frame poll() hands out (drop-from-front ring)
     udp: std.ArrayListUnmanaged(UdpSess) = .empty,
     tcp: std.ArrayListUnmanaged(TcpConn) = .empty,
     inbound: std.ArrayListUnmanaged(Inbound) = .empty,
@@ -415,10 +416,18 @@ pub const Nat = struct {
     }
 
     pub fn poll(self: *Nat, out: []u8) ?usize {
-        if (self.rx.items.len == 0) return null;
-        const f = self.rx.orderedRemove(0);
+        // Eat from the front via an index instead of orderedRemove(0): removing
+        // the head of an ArrayList of 1.6 KB frames memmoves the whole tail per
+        // frame (quadratic under a burst). The list resets once fully drained.
+        if (self.rx_head >= self.rx.items.len) return null;
+        const f = &self.rx.items[self.rx_head];
         const n = @min(f.len, out.len);
         @memcpy(out[0..n], f.data[0..n]);
+        self.rx_head += 1;
+        if (self.rx_head == self.rx.items.len) {
+            self.rx.clearRetainingCapacity();
+            self.rx_head = 0;
+        }
         return n;
     }
 

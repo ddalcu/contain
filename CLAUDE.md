@@ -60,9 +60,12 @@ src/
   main.zig              CLI (docker-style `run`/`build`/`compose`); the embedded
                         default init script; interactive-tty + raw-terminal
                         handling; run/build/compose/pull/boot/mkinitramfs/stripbtf.
-                        `run` on x86 mounts the image rootfs over virtio-fs
+                        `run` mounts the image rootfs over virtio-fs
                         (demand-paged root=rootfs) instead of an in-RAM initramfs
                         — the big memory win (see contain-virtiofs-build-compose).
+                        Default on both arches now (was x86-only); arm64 needs a
+                        FUSE-enabled guest kernel (build_kernel.sh enables it) and
+                        the arm64 bootargs set root=rootfs in cmdBoot.
   build.zig             Dockerfile parser (core instruction set) for `contain build`
   compose.zig           compose.yaml parser (service subset) for `contain compose`
   capi.zig              C ABI for embedding (export fn contain_*; see contain.h)
@@ -95,9 +98,9 @@ src/
     i8259.zig           PIC (probe)} arm64 uses the GIC instead.
     cmos.zig            MC146818 RTC (x86; stops the kernel's UIP poll)
     virtio.zig          virtio-mmio transport + virtio-blk (host-file backed)
-    virtio_9p.zig       virtio-9p / 9P2000.L (host-directory backed; arm64 default)
+    virtio_9p.zig       virtio-9p / 9P2000.L (host-dir backed; CONTAIN_SHARE_FS=9p fallback)
     virtio_fs.zig       virtio-fs / FUSE (host-dir backed; DEFAULT share + rootfs
-                        transport on x86 — POSIX-complete, symlink-sidecar aware)
+                        transport on both arches — POSIX-complete, symlink-sidecar aware)
     virtio_net.zig      virtio-net device (RX/TX virtqueues)
     virtio_rng.zig      virtio-rng (always-on entropy; essential under hw-virt)
   net/nat.zig           userspace slirp-style NAT (ARP/ICMP/DHCP/DNS + TCP/UDP relay
@@ -261,6 +264,22 @@ built-in kernel.
 - Keep host attack surface minimal: only file I/O (disk/9p) and the NAT's
   outbound sockets. Don't add host capabilities the guest can reach without a
   clear reason.
+- **Untrusted-input invariants (don't regress).** Everything the guest or a
+  pulled image controls is hostile; validate before it touches host memory or
+  the host filesystem:
+  - virtqueue descriptors: bound the chain walk by the queue size, clamp the
+    queue size to `[1, max]` (a `% 0` crashes the host), and range-check guest
+    addresses/lengths (use `Bus.ramSlice`, which is overflow-safe).
+  - 9p/FUSE: the T-message readers (`rd16/32/64`, `rdBytes` in `virtio_9p.zig`)
+    return 0 / empty on a short message instead of slicing OOB; the reply
+    `Writer` bounds-checks; names are single components (reject embedded `/`,
+    `\`, NUL → `error.BadName`) so they can't escape the share.
+  - OCI unpack (`registry.zig`): `safeRelPath` rejects `..`/absolute tar
+    entries, `symlinkEscapes` rejects symlink targets that climb out of the
+    rootfs, and `verifyDigest`/`digestMatches` check every blob against its
+    sha256 before caching/unpacking.
+  - Generated guest init: image/CLI env + workdir are shell-escaped
+    (`shellExportEnv`/`shellQuoteBare` in `main.zig`), argv via `shellQuote`.
 
 ## Gotchas (hard-won — read before debugging)
 
