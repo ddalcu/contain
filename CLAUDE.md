@@ -60,9 +60,12 @@ src/
   main.zig              CLI (docker-style `run`/`build`/`compose`); the embedded
                         default init script; interactive-tty + raw-terminal
                         handling; run/build/compose/pull/boot/mkinitramfs/stripbtf.
-                        `run` on x86 mounts the image rootfs over virtio-fs
+                        `run` mounts the image rootfs over virtio-fs
                         (demand-paged root=rootfs) instead of an in-RAM initramfs
                         — the big memory win (see contain-virtiofs-build-compose).
+                        Default on both arches now (was x86-only); arm64 needs a
+                        FUSE-enabled guest kernel (build_kernel.sh enables it) and
+                        the arm64 bootargs set root=rootfs in cmdBoot.
   build.zig             Dockerfile parser (core instruction set) for `contain build`
   compose.zig           compose.yaml parser (service subset) for `contain compose`
   capi.zig              C ABI for embedding (export fn contain_*; see contain.h)
@@ -95,9 +98,9 @@ src/
     i8259.zig           PIC (probe)} arm64 uses the GIC instead.
     cmos.zig            MC146818 RTC (x86; stops the kernel's UIP poll)
     virtio.zig          virtio-mmio transport + virtio-blk (host-file backed)
-    virtio_9p.zig       virtio-9p / 9P2000.L (host-directory backed; arm64 default)
+    virtio_9p.zig       virtio-9p / 9P2000.L (host-dir backed; CONTAIN_SHARE_FS=9p fallback)
     virtio_fs.zig       virtio-fs / FUSE (host-dir backed; DEFAULT share + rootfs
-                        transport on x86 — POSIX-complete, symlink-sidecar aware)
+                        transport on both arches — POSIX-complete, symlink-sidecar aware)
     virtio_net.zig      virtio-net device (RX/TX virtqueues)
     virtio_rng.zig      virtio-rng (always-on entropy; essential under hw-virt)
   net/nat.zig           userspace slirp-style NAT (ARP/ICMP/DHCP/DNS + TCP/UDP relay

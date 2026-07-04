@@ -779,6 +779,19 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
     var m = try Machine.init(gpa, io, ram_size, share, rootfs_share, true, rng_seed[0..32].*); // networking on
     defer m.deinit();
 
+    // Build the kernel command line. With a rootfs-over-virtiofs boot the kernel
+    // mounts the host rootfs dir as its real root (demand-paged) via
+    // `root=rootfs rootfstype=virtiofs` + the per-run `init=`; otherwise the rootfs
+    // rides in the initramfs and we `rdinit=/init`. (Mirrors initX86's cmdline.)
+    var argbuf: [256]u8 = undefined;
+    const bootargs: []const u8 = if (rootfs_share != null) blk: {
+        const extra = if (interactive) " contain.interactive" else "";
+        break :blk std.fmt.bufPrint(&argbuf, "console=ttyAMA0 earlycon=pl011,0x9000000 root=rootfs rootfstype=virtiofs rw rootwait init={s}{s} panic=-1", .{ machine_mod.rootfs_init_path, extra }) catch "console=ttyAMA0 earlycon=pl011,0x9000000 root=rootfs rootfstype=virtiofs rw rootwait init=/.contain-init panic=-1";
+    } else if (interactive)
+        "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive panic=-1"
+    else
+        "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1";
+
     const dtb = try fdt.buildVirtDtb(gpa, .{
         .ram_base = machine_mod.ram_base,
         .ram_size = ram_size,
@@ -788,10 +801,7 @@ fn cmdBoot(gpa: std.mem.Allocator, io: std.Io, image_path: []const u8, initrd_pa
         // panic=-1: on any kernel panic (e.g. an image with no /bin/sh, so /init
         // can't exec) reboot immediately -> PSCI SYSTEM_RESET -> the run loop exits
         // cleanly instead of the vCPU spinning forever with no way out.
-        .bootargs = if (interactive)
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init contain.interactive panic=-1"
-        else
-            "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1",
+        .bootargs = bootargs,
         .initrd_start = if (initrd != null) initrd_start else null,
         .initrd_end = initrd_end,
         .num_virtio = m.num_virtio,
@@ -1560,12 +1570,12 @@ var force_initramfs_root: bool = false;
 var overlay_isolation: bool = true;
 
 /// Whether `contain run` mounts the image rootfs over virtio-fs (demand-paged,
-/// memory-lean) vs. packing it into an in-RAM initramfs. Default: yes on x86
-/// (ships a FUSE guest kernel); arm64 falls back until its FUSE kernel is released.
-/// CONTAIN_ROOTFS=initramfs forces the legacy pack.
+/// memory-lean) vs. packing it into an in-RAM initramfs. Default on both arches
+/// now that the guest kernels (x86 and arm64) both ship CONFIG_VIRTIO_FS
+/// (tools/build_kernel.sh). CONTAIN_ROOTFS=initramfs forces the legacy pack (the
+/// escape hatch for an older fetched kernel without FUSE).
 fn useVirtiofsRoot() bool {
-    if (force_initramfs_root) return false;
-    return builtin.cpu.arch == .x86_64;
+    return !force_initramfs_root;
 }
 
 /// Accumulated build state -> the output image config.

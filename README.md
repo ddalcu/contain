@@ -113,9 +113,10 @@ There is no container runtime underneath — `contain` **is** the runtime:
    ~11 MB) on the host hypervisor — HVF, KVM, or WHP, auto-selected. The
    device models (virtio-blk/net/fs/9p/rng, UART, GICv2/IOAPIC) are shared
    across all three backends.
-3. **Run.** On x86 the image rootfs is mounted over virtio-fs and
-   **demand-paged** from the host — only the files the workload actually
-   touches use memory. Networking is a userspace slirp-style NAT: DHCP, DNS,
+3. **Run.** The image rootfs is mounted over virtio-fs and **demand-paged**
+   from the host — only the files the workload actually touches use memory, so
+   a big image runs in a fraction of the RAM instead of being packed into an
+   in-RAM initramfs. Networking is a userspace slirp-style NAT: DHCP, DNS,
    and a real TCP stack with flow control and retransmission, so large
    `npm install`s just work. Compose services get virtual IPs, name resolution,
    and a private writable overlay each.

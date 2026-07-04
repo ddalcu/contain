@@ -2,7 +2,6 @@
 //! exposes as `-M virt` so stock aarch64 kernels boot unmodified.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Bus = @import("bus.zig").Bus;
 const IrqLine = @import("devices/gicv2.zig").IrqLine;
 const Pl011 = @import("devices/uart_pl011.zig").Pl011;
@@ -271,15 +270,13 @@ pub const Machine = struct {
         return null;
     }
 
-    /// Choose the host-share transport. Default: virtio-fs on x86 — where contain
-    /// ships a FUSE-enabled guest kernel — and 9p on arm64 until the arm64 FUSE
-    /// kernel is released (the current arm64 release kernel has no CONFIG_VIRTIO_FS).
-    /// `share_9p_override` (from the caller's env, e.g. CONTAIN_SHARE_FS=9p) forces
-    /// legacy 9p.
+    /// Choose the host-share transport. Default virtio-fs (POSIX-complete,
+    /// memory-lean) on both arches, now that the guest kernels ship
+    /// CONFIG_VIRTIO_FS. `share_9p_override` (CONTAIN_SHARE_FS=9p) forces the
+    /// legacy 9p transport (e.g. for an older fetched kernel without FUSE).
     pub var share_9p_override: bool = false;
     fn useVirtiofs() bool {
-        if (share_9p_override) return false;
-        return builtin.cpu.arch == .x86_64;
+        return !share_9p_override;
     }
 
     fn appendVirtioCmd(cmd: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, base: u64, gsi: u32) !void {
